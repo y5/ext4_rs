@@ -7,11 +7,16 @@ use crate::utils::bitmap::*;
 
 impl Ext4 {
     pub fn get_bgid_of_inode(&self, inode_num: u32) -> u32 {
-        inode_num / self.super_block.inodes_per_group()
+        // Inode numbers are 1-based: inode N lives at bitmap bit (N-1), so the
+        // owning block group is (N-1) / inodes_per_group. Matching the inverse
+        // used in `ialloc_alloc_inode` (inode = bgid*ipg + idx + 1) and in
+        // `inode_disk_pos`. Without the -1, freeing inode N clears the bit that
+        // belongs to inode N+1, handing a live inode back out on the next alloc.
+        (inode_num - 1) / self.super_block.inodes_per_group()
     }
 
     pub fn inode_to_bgidx(&self, inode_num: u32) -> u32 {
-        inode_num % self.super_block.inodes_per_group()
+        (inode_num - 1) % self.super_block.inodes_per_group()
     }
 
     /// Get inode disk position.
