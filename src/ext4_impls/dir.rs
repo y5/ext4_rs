@@ -258,7 +258,21 @@ impl Ext4 {
         while offset < BLOCK_SIZE - size_of::<Ext4DirEntryTail>() {
             let mut de = Ext4DirEntry::try_from(&block.data[offset..]).unwrap();
 
+            // Record length used to advance to the next entry.
+            // A zero rec_len (corrupt/malformed directory block) would leave `offset`
+            // unchanged and spin this loop forever.
+            // Bail out instead of hanging.
+            let entry_rec_len = de.entry_len() as usize;
+            if entry_rec_len == 0 {
+                break;
+            }
+
             if de.unused() {
+                // We skip the free/unused slot. `offset` MUST advance here
+                // since a bare `continue` would re-read the same entry forever.
+                // This would cause an infinite loop on any directory block containing
+                // an unused entry.
+                offset += entry_rec_len;
                 continue;
             }
 
@@ -295,7 +309,7 @@ impl Ext4 {
             }
 
             // Move to the next entry
-            offset += de.entry_len() as usize;
+            offset += entry_rec_len;
         }
 
         return_errno_with_message!(Errno::ENOSPC, "No space in block for new entry");
