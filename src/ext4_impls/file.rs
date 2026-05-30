@@ -84,9 +84,17 @@ impl Ext4 {
     }
 
     pub fn create_inode(&self, inode_mode: u16) -> Result<Ext4InodeRef> {
-        let inode_file_type = match InodeFileType::from_bits(inode_mode) {
-            Some(file_type) => file_type,
-            None => InodeFileType::S_IFREG,
+        // `inode_mode` may carry only the format bits (e.g. S_IFDIR for an
+        // intermediate path component), only permission bits (e.g. 0o644 from a
+        // path-based file create), or both. Pull the format from the high bits
+        // and default to a regular file when none was supplied - `from_bits`
+        // would reject any input that also carries perm bits and silently fall
+        // through to S_IFREG without recording the type in the mode.
+        let type_bits = inode_mode & EXT4_INODE_MODE_TYPE_MASK;
+        let inode_file_type = if type_bits != 0 {
+            InodeFileType::from_bits_truncate(type_bits)
+        } else {
+            InodeFileType::S_IFREG
         };
 
         let is_dir = inode_file_type == InodeFileType::S_IFDIR;
@@ -97,8 +105,14 @@ impl Ext4 {
         // initialize inode
         let mut inode = Ext4Inode::default();
 
-        // set mode
-        inode.set_mode(inode_mode | 0o777);
+        // Store the format bits alongside the perms so is_file()/is_dir() and
+        // the directory-entry type are correct. Preserve requested perms, or
+        // pick a sane default when the caller passed none.
+        let mut perm = inode_mode & EXT4_INODE_MODE_PERM_MASK;
+        if perm == 0 {
+            perm = if is_dir { 0o755 } else { 0o644 };
+        }
+        inode.set_mode(inode_file_type.bits() | perm);
 
         // set extra size
         let inode_size = self.super_block.inode_size();
