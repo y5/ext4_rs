@@ -59,12 +59,25 @@ impl Ext4 {
 
         // Handle the case where depth is 0
         if let Some((extent, pos)) = node.binsearch_extent(lblock) {
+            // LOCAL FIX (hole): binsearch_extent returns the nearest *preceding*
+            // extent even when `lblock` lies in a gap beyond it. Only map to a
+            // physical block when `lblock` actually falls within the extent's
+            // range; otherwise it's a hole — report pblock 0 so the reader
+            // zero-fills instead of reading bogus blocks past the extent.
+            let first = extent.get_first_block() as u64;
+            let end = first + extent.get_actual_len() as u64;
+            let lblk = lblock as u64;
+            let pblock = if lblk >= first && lblk < end {
+                lblk - first + extent.get_pblock()
+            } else {
+                0
+            };
             search_path.path.push(ExtentPathNode {
                 header: node.header,
                 index: None,
                 extent: Some(extent),
                 position: pos,
-                pblock: lblock as u64 - extent.get_first_block() as u64 + extent.get_pblock(),
+                pblock,
                 pblock_of_node,
             });
             search_path.maxdepth = node.header.depth;

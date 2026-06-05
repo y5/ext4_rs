@@ -230,15 +230,24 @@ impl Ext4 {
                 }
             };
 
-            // read data
-            let data = self
-                .block_device
-                .read_offset(pblock_idx as usize * BLOCK_SIZE);
+            // LOCAL FIX (hole): a logical block with no extent maps to physical
+            // block 0. Reading device block 0 returns the superblock area, not
+            // the file's data — POSIX requires a hole to read as zeros.
+            if pblock_idx == 0 {
+                for b in &mut read_buf[cursor..cursor + adjust_read_size] {
+                    *b = 0;
+                }
+            } else {
+                // read data
+                let data = self
+                    .block_device
+                    .read_offset(pblock_idx as usize * BLOCK_SIZE);
 
-            // copy data to read buffer
-            read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
-                &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
-            );
+                // copy data to read buffer
+                read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
+                    &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
+                );
+            }
 
             // update cursor and total bytes read
             cursor += adjust_read_size;
@@ -271,14 +280,21 @@ impl Ext4 {
                 }
             };
 
-            // read data
-            let data = self
-                .block_device
-                .read_offset(pblock_idx as usize * BLOCK_SIZE);
-            // log::trace!("[Read] Read block data - physical_block: {}, data_len: {}", pblock_idx, data.len());
+            // LOCAL FIX (hole): physical block 0 means this logical block is
+            // unmapped (a hole) — read it as zeros, not the on-disk superblock.
+            if pblock_idx == 0 {
+                for b in &mut read_buf[cursor..cursor + read_length] {
+                    *b = 0;
+                }
+            } else {
+                // read data
+                let data = self
+                    .block_device
+                    .read_offset(pblock_idx as usize * BLOCK_SIZE);
 
-            // copy data to read buffer
-            read_buf[cursor..cursor + read_length].copy_from_slice(&data[..read_length]);
+                // copy data to read buffer
+                read_buf[cursor..cursor + read_length].copy_from_slice(&data[..read_length]);
+            }
 
             // update cursor and total bytes read
             cursor += read_length;
@@ -342,19 +358,34 @@ impl Ext4 {
         // Start bgid for block allocation
         let mut start_bgid = 0;
 
-        // Pre-allocate blocks if needed
+        // Pre-allocate blocks if needed. Only the portion of the write at or
+        // beyond EOF needs new blocks; an in-place overwrite needs none. Use
+        // saturating_sub — a plain `usize` subtraction here underflows when the
+        // write lies fully within existing blocks, producing an astronomically
+        // large count that drives a capacity-overflow panic on allocation.
         let blocks_to_allocate = if iblk_idx >= ifile_blocks as usize {
             total_blocks_needed
         } else {
-            max(0, total_blocks_needed - (ifile_blocks as usize - iblk_idx))
+            total_blocks_needed.saturating_sub(ifile_blocks as usize - iblk_idx)
         };
 
         if blocks_to_allocate > 0 {
             log::trace!("[Pre-allocation] Allocating {} blocks", blocks_to_allocate);
 
-            // 使用append_inode_pblk_batch进行批量块分配
-            let allocated_blocks =
-                self.append_inode_pblk_batch(&mut inode_ref, &mut start_bgid, blocks_to_allocate)?;
+            // Map the new blocks at the first logical block of the write that
+            // lies at or beyond EOF. For an append this is the next block; for a
+            // sparse write past a gap it is the write's start block, leaving the
+            // gap as a hole. Mapping contiguously after the last extent instead
+            // (the old `append_inode_pblk_batch` behaviour) lands the data at the
+            // wrong logical block — the target stays a hole and the write hits
+            // physical block 0, corrupting the superblock.
+            let target_lblock = max(iblock_start, ifile_blocks as usize) as u32;
+            let allocated_blocks = self.map_inode_pblk_batch(
+                &mut inode_ref,
+                &mut start_bgid,
+                target_lblock,
+                blocks_to_allocate,
+            )?;
 
             // If we couldn't allocate all blocks, adjust the write size
             if allocated_blocks.len() < blocks_to_allocate {
