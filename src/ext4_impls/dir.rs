@@ -491,7 +491,7 @@ impl Ext4 {
 
         // Only empty directories (containing just '.' and '..') can be removed.
         if self.dir_has_entry(child_inode_ref.inode_num) {
-            return_errno_with_message!(Errno::ENOTSUP, "rm dir with children not supported")
+            return_errno_with_message!(Errno::ENOTEMPTY, "directory not empty")
         }
 
         // Remove the entry from the parent directory.

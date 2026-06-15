@@ -32,6 +32,7 @@ pub enum Errno {
     EMLINK = 31,       /* Too many links */
     EPIPE = 32,        /* Broken pipe */
     ENAMETOOLONG = 36, /* File name too long */
+    ENOTEMPTY = 39,    /* Directory not empty */
     ENOTSUP = 95,      /* Not supported */
 }
 
