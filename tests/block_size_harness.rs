@@ -1084,6 +1084,74 @@ fn rename_into_own_subtree_4k() {
     rename_into_own_subtree(4096);
 }
 
+// --- deep / multi-level extent trees ---
+
+/// Write `n` single-block regions at non-contiguous logical offsets (gaps
+/// between them), so each becomes its own non-mergeable extent. With enough
+/// extents the inode's 4-entry root overflows and the tree must grow to a
+/// multi-level (index -> leaf) shape, splitting nodes as leaves fill. e2fsck
+/// must stay clean and every block must read back.
+fn fragmented_file(block_size: u32, n: usize, min_depth: u16) {
+    if !tooling_ready() {
+        return;
+    }
+    let bs = block_size as usize;
+    let img = fresh_image(block_size, &format!("frag{}", n));
+    let mk = |i: usize| -> Vec<u8> { payload(bs).iter().map(|b| b ^ (i as u8)).collect() };
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "frag.bin", reg_mode()).expect("create");
+        for i in 0..n {
+            // logical blocks 0, 2, 4, ... — a hole between each keeps the
+            // extents from merging.
+            ext4.write_at(f.inode_num, i * 2 * bs, &mk(i)).expect("write");
+        }
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let ino = resolve(&ext4, "/frag.bin").expect("resolve");
+
+    // The tree must actually have grown to the expected shape, else the test
+    // isn't exercising the multi-level paths it claims to.
+    let depth = ext4.get_inode_ref(ino).inode.root_extent_header().depth;
+    assert!(depth >= min_depth, "extent tree depth {depth} < {min_depth} @ {block_size}");
+
+    for i in 0..n {
+        let mut buf = vec![0u8; bs];
+        ext4.read_at(ino, i * 2 * bs, &mut buf).expect("read");
+        assert_eq!(buf, mk(i), "extent {i} mismatch @ {block_size}");
+    }
+}
+
+#[test]
+fn fragmented_shallow_1k() {
+    // ~8 extents: overflows the 4-entry root, depth 1, no leaf split.
+    fragmented_file(1024, 8, 1);
+}
+#[test]
+fn fragmented_deep_1k() {
+    // >84 extents: a 1 KiB leaf fills and must split.
+    fragmented_file(1024, 200, 1);
+}
+#[test]
+fn fragmented_deep_4k() {
+    fragmented_file(4096, 200, 1);
+}
+#[test]
+fn fragmented_depth2_1k() {
+    // Enough extents to fill the 4-entry root index and grow to depth 2
+    // (root -> index -> leaf).
+    fragmented_file(1024, 600, 2);
+}
+#[test]
+fn fragmented_huge_1k() {
+    // Enough extents that an internal (depth-1) index node fills and must
+    // itself split, not just the leaves.
+    fragmented_file(1024, 8000, 2);
+}
+
 #[test]
 fn symlink_fast_1k() {
     symlink_roundtrip(1024, "symlink_fast", FAST_TARGET);

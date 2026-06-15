@@ -511,48 +511,218 @@ impl Ext4 {
 
             return Ok(());
         }
-
-        return_errno_with_message!(Errno::ENOTSUP, "Not supported insert extent at nonroot");
     }
 
-    // finds empty index and adds new leaf. if no free index is found, then it requests in-depth growing.
+    // Handle insertion when the target leaf is full.
     fn create_new_leaf(
         &self,
         inode_ref: &mut Ext4InodeRef,
         search_path: &mut SearchPath,
         new_extent: &mut Ext4Extent,
     ) -> Result<()> {
-        log::info!("[create_new_leaf] Starting - Current tree state:");
-        log::info!(
-            "[create_new_leaf] Root header: magic={:x}, entries={}, max={}, depth={}",
-            inode_ref.inode.root_extent_header().magic,
-            inode_ref.inode.root_extent_header().entries_count,
-            inode_ref.inode.root_extent_header().max_entries_count,
-            inode_ref.inode.root_extent_header().depth
-        );
-        log::info!(
-            "[create_new_leaf] New extent: logical block {}, physical block {}, length {}",
-            new_extent.first_block,
-            new_extent.get_pblock(),
-            new_extent.get_actual_len()
-        );
+        let depth = search_path.depth as usize;
 
-        // tree is full, time to grow in depth
-        log::info!("[create_new_leaf] Tree is full, calling ext_grow_indepth");
+        // The full leaf *is* the root (depth-0 tree): deepen by one level so the
+        // root becomes an index pointing at a single, now-non-full leaf, then
+        // retry the insert into that leaf.
+        if depth == 0 {
+            log::info!("[create_new_leaf] Root leaf full, growing in depth");
+            self.ext_grow_indepth(inode_ref)?;
+            return self.insert_extent(inode_ref, new_extent);
+        }
+
+        // A non-root leaf is full: split it and propagate a separator index up
+        // the tree (splitting internal nodes / growing depth as needed).
+        log::info!("[create_new_leaf] Non-root leaf full at depth {}, splitting", depth);
+        self.split_leaf(inode_ref, search_path, new_extent)
+    }
+
+    /// Maximum 12-byte entries (extents or indices) an on-disk node block can
+    /// hold, leaving room for the 4-byte tail checksum at `12 + max*12`.
+    fn node_max_entries(&self) -> usize {
+        (self.block_size() - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE
+    }
+
+    /// Read a node block's header and its entries as raw 12-byte slots (an
+    /// extent and an index are both 12-byte records, so this stays type-agnostic).
+    fn read_node_slots(&self, pblk: usize) -> (Ext4ExtentHeader, Vec<[u8; 12]>) {
+        let blk = Block::load(&self.block_device, pblk * self.block_size(), self.block_size());
+        let header: Ext4ExtentHeader = blk.read_offset_as(0);
+        let count = header.entries_count as usize;
+        let mut slots = Vec::with_capacity(count);
+        for i in 0..count {
+            let o = EXT4_EXTENT_HEADER_SIZE + i * EXT4_EXTENT_SIZE;
+            let mut s = [0u8; 12];
+            s.copy_from_slice(&blk.data[o..o + 12]);
+            slots.push(s);
+        }
+        (header, slots)
+    }
+
+    /// Rewrite a node block with the given depth and entry slots (zeroing the
+    /// remainder), then sync it and refresh its tail checksum.
+    fn write_node_slots(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        pblk: usize,
+        depth: u16,
+        slots: &[[u8; 12]],
+    ) -> Result<()> {
+        let max = self.node_max_entries() as u16;
+        let mut blk = Block::load(&self.block_device, pblk * self.block_size(), self.block_size());
+        blk.data.fill(0);
+
+        let header = Ext4ExtentHeader::new(EXT4_EXTENT_MAGIC, slots.len() as u16, max, depth, 0);
+        let hb: [u8; 12] = unsafe { core::mem::transmute(header) };
+        blk.data[..12].copy_from_slice(&hb);
+
+        for (i, s) in slots.iter().enumerate() {
+            let o = EXT4_EXTENT_HEADER_SIZE + i * EXT4_EXTENT_SIZE;
+            blk.data[o..o + 12].copy_from_slice(s);
+        }
+
+        blk.sync_blk_to_disk(&self.block_device);
+        self.set_extent_block_checksum(inode_ref, pblk)?;
+        Ok(())
+    }
+
+    fn slot_first_block(slot: &[u8; 12]) -> u32 {
+        u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]])
+    }
+
+    fn make_index_slot(first_block: u32, child_pblk: usize) -> [u8; 12] {
+        let mut ix = Ext4ExtentIndex::default();
+        ix.first_block = first_block;
+        ix.store_pblock(child_pblk as u64);
+        unsafe { core::mem::transmute(ix) }
+    }
+
+    /// Split a full non-root leaf (inserting `new_extent` in sorted order), then
+    /// propagate the new separator index up to the parent.
+    fn split_leaf(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        search_path: &SearchPath,
+        new_extent: &Ext4Extent,
+    ) -> Result<()> {
+        let depth = search_path.depth as usize;
+        let leaf_pblk = search_path.path[depth].pblock_of_node;
+
+        let (_, mut slots) = self.read_node_slots(leaf_pblk);
+
+        // Insert keeping the slots sorted by first logical block.
+        let newe: [u8; 12] = unsafe { core::mem::transmute(*new_extent) };
+        let nk = new_extent.first_block;
+        let pos = slots
+            .iter()
+            .position(|s| Self::slot_first_block(s) > nk)
+            .unwrap_or(slots.len());
+        slots.insert(pos, newe);
+
+        // Move the upper half into a freshly allocated sibling leaf.
+        let split = slots.len() / 2;
+        let sep = Self::slot_first_block(&slots[split]);
+        let new_pblk = self.balloc_alloc_block(inode_ref, None)? as usize;
+
+        self.write_node_slots(inode_ref, leaf_pblk, 0, &slots[..split])?;
+        self.write_node_slots(inode_ref, new_pblk, 0, &slots[split..])?;
+
+        // Index the new sibling in the parent, one level up.
+        self.insert_index_at_level(inode_ref, search_path, depth - 1, sep, new_pblk)
+    }
+
+    /// Insert a separator index (`sep` -> `child_pblk`) into the node at `level`
+    /// of the search path. If that node is full it splits and recurses to its
+    /// parent; reaching a full root grows the tree in depth.
+    fn insert_index_at_level(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        search_path: &SearchPath,
+        level: usize,
+        sep: u32,
+        child_pblk: usize,
+    ) -> Result<()> {
+        let node_pblk = search_path.path[level].pblock_of_node;
+
+        // The root index node lives in the inode itself.
+        if node_pblk == 0 {
+            return self.add_index_to_root(inode_ref, sep, child_pblk);
+        }
+
+        let (header, mut slots) = self.read_node_slots(node_pblk);
+        let node_depth = header.depth;
+
+        let idx = Self::make_index_slot(sep, child_pblk);
+        let pos = slots
+            .iter()
+            .position(|s| Self::slot_first_block(s) > sep)
+            .unwrap_or(slots.len());
+        slots.insert(pos, idx);
+
+        if slots.len() <= self.node_max_entries() {
+            return self.write_node_slots(inode_ref, node_pblk, node_depth, &slots);
+        }
+
+        // Internal node full: split and promote a separator to the grandparent.
+        let split = slots.len() / 2;
+        let up_sep = Self::slot_first_block(&slots[split]);
+        let new_pblk = self.balloc_alloc_block(inode_ref, None)? as usize;
+
+        self.write_node_slots(inode_ref, node_pblk, node_depth, &slots[..split])?;
+        self.write_node_slots(inode_ref, new_pblk, node_depth, &slots[split..])?;
+
+        self.insert_index_at_level(inode_ref, search_path, level - 1, up_sep, new_pblk)
+    }
+
+    /// Insert a separator index into the root index node, growing the tree in
+    /// depth first if the root is full.
+    fn add_index_to_root(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        sep: u32,
+        child_pblk: usize,
+    ) -> Result<()> {
+        let entries = inode_ref.inode.root_extent_header().entries_count as usize;
+        let max = inode_ref.inode.root_extent_header().max_entries_count as usize;
+
+        if entries < max {
+            // Sorted insert among the root's index entries.
+            let mut pos = entries;
+            for i in 0..entries {
+                if inode_ref.inode.root_index_at(i).first_block > sep {
+                    pos = i;
+                    break;
+                }
+            }
+            for i in (pos..entries).rev() {
+                let cur = inode_ref.inode.root_index_at(i);
+                *inode_ref.inode.root_index_mut_at(i + 1) = cur;
+            }
+            let mut ix = Ext4ExtentIndex::default();
+            ix.first_block = sep;
+            ix.store_pblock(child_pblk as u64);
+            *inode_ref.inode.root_index_mut_at(pos) = ix;
+            inode_ref.inode.root_extent_header_mut().entries_count += 1;
+
+            self.write_back_inode(inode_ref);
+            return Ok(());
+        }
+
+        // Root full: deepen. ext_grow_indepth moves the four root indices into a
+        // single child node and leaves the root with one index pointing at it;
+        // the new separator then belongs in that child, which now has room.
         self.ext_grow_indepth(inode_ref)?;
+        let child = inode_ref.inode.root_first_index_mut().get_pblock() as usize;
 
-        log::info!("[create_new_leaf] After ext_grow_indepth - New tree state:");
-        log::info!(
-            "[create_new_leaf] Root header: magic={:x}, entries={}, max={}, depth={}",
-            inode_ref.inode.root_extent_header().magic,
-            inode_ref.inode.root_extent_header().entries_count,
-            inode_ref.inode.root_extent_header().max_entries_count,
-            inode_ref.inode.root_extent_header().depth
-        );
-
-        // insert again
-        log::info!("[create_new_leaf] Attempting to insert extent again");
-        self.insert_extent(inode_ref, new_extent)
+        let (header, mut slots) = self.read_node_slots(child);
+        let node_depth = header.depth;
+        let idx = Self::make_index_slot(sep, child_pblk);
+        let pos = slots
+            .iter()
+            .position(|s| Self::slot_first_block(s) > sep)
+            .unwrap_or(slots.len());
+        slots.insert(pos, idx);
+        self.write_node_slots(inode_ref, child, node_depth, &slots)
     }
 
     // allocates new block
@@ -585,8 +755,11 @@ impl Ext4 {
         let old_depth = old_root_header.depth;
         let old_entries_count = old_root_header.entries_count;
 
-        // Get logical block number of first extent (only when original was a leaf node)
-        let first_logical_block = if old_depth == 0 && old_entries_count > 0 {
+        // Logical block of the root's first entry. The first 4 bytes of an
+        // extent and of an index are both `first_block`, so this is correct
+        // whether the old root was a leaf or an index node - the moved child
+        // must be indexed by its leftmost logical block.
+        let first_logical_block = if old_entries_count > 0 {
             inode_ref.inode.root_extent_at(0).first_block
         } else {
             0
@@ -602,8 +775,8 @@ impl Ext4 {
             EXT4_EXTENT_MAGIC,
             old_entries_count,
             ((self.block_size() - header_size) / EXT4_EXTENT_SIZE) as u16, // Maximum entries the new block can hold
-            0, // New block becomes a leaf node, depth 0
-            0, // generation field, usually 0
+            old_depth, // child keeps the old root's depth (leaf if it was a leaf, index otherwise)
+            0,         // generation field, usually 0
         );
 
         // Write header to new block
