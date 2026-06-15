@@ -628,6 +628,462 @@ fn hardlink_4k() {
     hardlink_roundtrip(4096);
 }
 
+// --- rename ---
+
+/// Resolve a path relative to root, returning the inode number or None.
+fn resolve(ext4: &Ext4, path: &str) -> Option<u32> {
+    ext4.generic_open(path, &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .ok()
+}
+
+/// Rename a file within the same directory to a name that doesn't yet exist.
+/// The inode and its data must survive; the old name must disappear.
+fn rename_file_samedir(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_file_same");
+    let data = payload(4000);
+
+    let ino;
+    {
+        let mut ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "a.bin", reg_mode()).expect("create");
+        ino = f.inode_num;
+        ext4.write_at(f.inode_num, 0, &data).expect("write");
+        ext4.fuse_rename(ROOT_INODE as u64, "a.bin", ROOT_INODE as u64, "b.bin", 0)
+            .expect("rename");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/a.bin").is_none(), "old name still resolves @ {block_size}");
+    let b = resolve(&ext4, "/b.bin").expect("new name missing");
+    assert_eq!(b, ino, "renamed to a different inode @ {block_size}");
+
+    let mut buf = vec![0u8; data.len()];
+    let n = ext4.read_at(b, 0, &mut buf).expect("read renamed");
+    assert_eq!(n, data.len(), "renamed short read @ {block_size}");
+    assert_eq!(buf, data, "renamed content mismatch @ {block_size}");
+}
+
+#[test]
+fn rename_file_samedir_1k() {
+    rename_file_samedir(1024);
+}
+#[test]
+fn rename_file_samedir_4k() {
+    rename_file_samedir(4096);
+}
+
+/// Move a file from one directory to another (different parent). Its contents
+/// must survive, the old path must disappear, and the new path must resolve.
+fn rename_file_crossdir(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_file_cross");
+    let data = payload(4000);
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.dir_mk("/src").expect("mkdir src");
+        ext4.dir_mk("/dst").expect("mkdir dst");
+        let src = resolve(&ext4, "/src").expect("resolve src");
+        let f = ext4.create(src, "f.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &data).expect("write");
+        let dst = resolve(&ext4, "/dst").expect("resolve dst");
+        ext4.fuse_rename(src as u64, "f.bin", dst as u64, "f.bin", 0)
+            .expect("rename");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/src/f.bin").is_none(), "old path resolves @ {block_size}");
+    let b = resolve(&ext4, "/dst/f.bin").expect("new path missing");
+    let mut buf = vec![0u8; data.len()];
+    ext4.read_at(b, 0, &mut buf).expect("read");
+    assert_eq!(buf, data, "content mismatch @ {block_size}");
+}
+
+#[test]
+fn rename_file_crossdir_1k() {
+    rename_file_crossdir(1024);
+}
+#[test]
+fn rename_file_crossdir_4k() {
+    rename_file_crossdir(4096);
+}
+
+/// Move a non-empty directory to a different parent. The '..' entry must be
+/// repointed and the parents' link counts adjusted, or e2fsck flags the image.
+fn rename_dir_crossdir(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_dir_cross");
+    let data = payload(3000);
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.dir_mk("/src").expect("mkdir src");
+        ext4.dir_mk("/dst").expect("mkdir dst");
+        ext4.dir_mk("/src/d").expect("mkdir src/d");
+        let d = resolve(&ext4, "/src/d").expect("resolve d");
+        let f = ext4.create(d, "inside.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &data).expect("write");
+
+        let src = resolve(&ext4, "/src").expect("resolve src");
+        let dst = resolve(&ext4, "/dst").expect("resolve dst");
+        ext4.fuse_rename(src as u64, "d", dst as u64, "d", 0)
+            .expect("rename dir");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/src/d").is_none(), "old dir path resolves @ {block_size}");
+    let moved = resolve(&ext4, "/dst/d").expect("moved dir missing");
+    let inside = resolve(&ext4, "/dst/d/inside.bin").expect("moved file missing");
+    let mut buf = vec![0u8; data.len()];
+    ext4.read_at(inside, 0, &mut buf).expect("read inside");
+    assert_eq!(buf, data, "moved content mismatch @ {block_size}");
+
+    // '..' inside the moved dir must now point at /dst.
+    let dst = resolve(&ext4, "/dst").expect("resolve dst");
+    let dotdot = resolve(&ext4, "/dst/d/..").expect("resolve ..");
+    assert_eq!(dotdot, dst, "'..' not repointed @ {block_size}");
+    let _ = moved;
+}
+
+#[test]
+fn rename_dir_crossdir_1k() {
+    rename_dir_crossdir(1024);
+}
+#[test]
+fn rename_dir_crossdir_4k() {
+    rename_dir_crossdir(4096);
+}
+
+/// Rename a file onto an existing file: the destination is replaced (its inode
+/// freed), and the new name carries the source's contents.
+fn rename_replace_file(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_repl_file");
+    let src_data = payload(4000);
+    let dst_data = payload(2000);
+
+    {
+        let mut ext4 = open_fs(&img);
+        let a = ext4.create(ROOT_INODE, "a.bin", reg_mode()).expect("create a");
+        ext4.write_at(a.inode_num, 0, &src_data).expect("write a");
+        let b = ext4.create(ROOT_INODE, "b.bin", reg_mode()).expect("create b");
+        ext4.write_at(b.inode_num, 0, &dst_data).expect("write b");
+        ext4.fuse_rename(ROOT_INODE as u64, "a.bin", ROOT_INODE as u64, "b.bin", 0)
+            .expect("rename over");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/a.bin").is_none(), "source survived @ {block_size}");
+    let b = resolve(&ext4, "/b.bin").expect("dest missing");
+    let mut buf = vec![0u8; src_data.len()];
+    ext4.read_at(b, 0, &mut buf).expect("read");
+    assert_eq!(buf, src_data, "dest not replaced with source @ {block_size}");
+}
+
+#[test]
+fn rename_replace_file_1k() {
+    rename_replace_file(1024);
+}
+#[test]
+fn rename_replace_file_4k() {
+    rename_replace_file(4096);
+}
+
+/// Rename a directory onto an existing empty directory: allowed, the empty
+/// target is removed and replaced by the source directory.
+fn rename_replace_empty_dir(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_repl_dir");
+    let data = payload(3000);
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.dir_mk("/a").expect("mkdir a");
+        let a = resolve(&ext4, "/a").expect("resolve a");
+        let f = ext4.create(a, "inside.bin", reg_mode()).expect("create inside");
+        ext4.write_at(f.inode_num, 0, &data).expect("write");
+        ext4.dir_mk("/b").expect("mkdir b (empty target)");
+        ext4.fuse_rename(ROOT_INODE as u64, "a", ROOT_INODE as u64, "b", 0)
+            .expect("rename dir over empty dir");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/a").is_none(), "source dir survived @ {block_size}");
+    let inside = resolve(&ext4, "/b/inside.bin").expect("moved file missing");
+    let mut buf = vec![0u8; data.len()];
+    ext4.read_at(inside, 0, &mut buf).expect("read");
+    assert_eq!(buf, data, "content mismatch @ {block_size}");
+}
+
+#[test]
+fn rename_replace_empty_dir_1k() {
+    rename_replace_empty_dir(1024);
+}
+#[test]
+fn rename_replace_empty_dir_4k() {
+    rename_replace_empty_dir(4096);
+}
+
+/// Error cases: the filesystem must stay clean and unchanged when a rename is
+/// rejected.
+fn rename_errors(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_errors");
+
+    {
+        let mut ext4 = open_fs(&img);
+        // /file is a regular file; /dir is a non-empty directory.
+        ext4.create(ROOT_INODE, "file", reg_mode()).expect("create file");
+        ext4.dir_mk("/dir").expect("mkdir dir");
+        let dir = resolve(&ext4, "/dir").expect("resolve dir");
+        ext4.create(dir, "child", reg_mode()).expect("create child");
+        ext4.dir_mk("/emptydir").expect("mkdir emptydir");
+
+        // Source does not exist -> ENOENT.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "nope", ROOT_INODE as u64, "x", 0)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::ENOENT, "missing source errno @ {block_size}");
+
+        // File onto an existing directory -> EISDIR.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "file", ROOT_INODE as u64, "dir", 0)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::EISDIR, "file-over-dir errno @ {block_size}");
+
+        // Directory onto an existing file -> ENOTDIR.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "dir", ROOT_INODE as u64, "file", 0)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::ENOTDIR, "dir-over-file errno @ {block_size}");
+
+        // Directory onto a non-empty directory -> ENOTEMPTY.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "emptydir", ROOT_INODE as u64, "dir", 0)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::ENOTEMPTY, "onto-nonempty errno @ {block_size}");
+    }
+    fsck_clean(&img); // every rejected rename must leave the image consistent
+
+    // Nothing moved.
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/file").is_some(), "file vanished @ {block_size}");
+    assert!(resolve(&ext4, "/dir/child").is_some(), "dir/child vanished @ {block_size}");
+    assert!(resolve(&ext4, "/emptydir").is_some(), "emptydir vanished @ {block_size}");
+}
+
+#[test]
+fn rename_errors_1k() {
+    rename_errors(1024);
+}
+#[test]
+fn rename_errors_4k() {
+    rename_errors(4096);
+}
+
+const RENAME_NOREPLACE: u32 = 1;
+const RENAME_EXCHANGE: u32 = 2;
+
+/// RENAME_NOREPLACE must refuse to clobber an existing destination (EEXIST) but
+/// still work when the destination is free.
+fn rename_noreplace(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_noreplace");
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.create(ROOT_INODE, "a.bin", reg_mode()).expect("create a");
+        ext4.create(ROOT_INODE, "b.bin", reg_mode()).expect("create b");
+
+        // Destination exists -> EEXIST, nothing changes.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "a.bin", ROOT_INODE as u64, "b.bin", RENAME_NOREPLACE)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::EEXIST, "noreplace errno @ {block_size}");
+
+        // Destination free -> succeeds.
+        ext4.fuse_rename(ROOT_INODE as u64, "a.bin", ROOT_INODE as u64, "c.bin", RENAME_NOREPLACE)
+            .expect("noreplace to free name");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/a.bin").is_none(), "a.bin survived @ {block_size}");
+    assert!(resolve(&ext4, "/b.bin").is_some(), "b.bin vanished @ {block_size}");
+    assert!(resolve(&ext4, "/c.bin").is_some(), "c.bin missing @ {block_size}");
+}
+
+#[test]
+fn rename_noreplace_1k() {
+    rename_noreplace(1024);
+}
+#[test]
+fn rename_noreplace_4k() {
+    rename_noreplace(4096);
+}
+
+/// RENAME_EXCHANGE atomically swaps two existing names; no inode is freed.
+fn rename_exchange_files(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_exch_file");
+    let a_data = payload(4000);
+    let b_data = payload(2000);
+
+    {
+        let mut ext4 = open_fs(&img);
+        let a = ext4.create(ROOT_INODE, "a.bin", reg_mode()).expect("create a");
+        ext4.write_at(a.inode_num, 0, &a_data).expect("write a");
+        let b = ext4.create(ROOT_INODE, "b.bin", reg_mode()).expect("create b");
+        ext4.write_at(b.inode_num, 0, &b_data).expect("write b");
+
+        // Missing partner -> ENOENT.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "a.bin", ROOT_INODE as u64, "nope", RENAME_EXCHANGE)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::ENOENT, "exchange-missing errno @ {block_size}");
+
+        ext4.fuse_rename(ROOT_INODE as u64, "a.bin", ROOT_INODE as u64, "b.bin", RENAME_EXCHANGE)
+            .expect("exchange");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    // Names persist but their contents are swapped.
+    let a = resolve(&ext4, "/a.bin").expect("a.bin missing");
+    let b = resolve(&ext4, "/b.bin").expect("b.bin missing");
+    let mut buf = vec![0u8; b_data.len()];
+    ext4.read_at(a, 0, &mut buf).expect("read a");
+    assert_eq!(buf, b_data, "a.bin not swapped @ {block_size}");
+    let mut buf = vec![0u8; a_data.len()];
+    ext4.read_at(b, 0, &mut buf).expect("read b");
+    assert_eq!(buf, a_data, "b.bin not swapped @ {block_size}");
+}
+
+#[test]
+fn rename_exchange_files_1k() {
+    rename_exchange_files(1024);
+}
+#[test]
+fn rename_exchange_files_4k() {
+    rename_exchange_files(4096);
+}
+
+/// RENAME_EXCHANGE of two directories in different parents: each '..' must end
+/// up pointing at its new parent and the link counts must stay consistent.
+fn rename_exchange_dirs(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_exch_dir");
+    let d1 = payload(3000);
+    let d2 = payload(1500);
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.dir_mk("/p").expect("mkdir p");
+        ext4.dir_mk("/q").expect("mkdir q");
+        ext4.dir_mk("/p/d1").expect("mkdir p/d1");
+        ext4.dir_mk("/q/d2").expect("mkdir q/d2");
+        let f1 = ext4.create(resolve(&ext4, "/p/d1").unwrap(), "f1", reg_mode()).expect("f1");
+        ext4.write_at(f1.inode_num, 0, &d1).expect("write f1");
+        let f2 = ext4.create(resolve(&ext4, "/q/d2").unwrap(), "f2", reg_mode()).expect("f2");
+        ext4.write_at(f2.inode_num, 0, &d2).expect("write f2");
+
+        let p = resolve(&ext4, "/p").unwrap();
+        let q = resolve(&ext4, "/q").unwrap();
+        ext4.fuse_rename(p as u64, "d1", q as u64, "d2", RENAME_EXCHANGE)
+            .expect("exchange dirs");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    // The directory trees swapped places: /p/d1 now holds f2, /q/d2 holds f1.
+    let mut buf = vec![0u8; d2.len()];
+    ext4.read_at(resolve(&ext4, "/p/d1/f2").expect("p/d1/f2 missing"), 0, &mut buf).expect("read");
+    assert_eq!(buf, d2, "/p/d1 not swapped @ {block_size}");
+    let mut buf = vec![0u8; d1.len()];
+    ext4.read_at(resolve(&ext4, "/q/d2/f1").expect("q/d2/f1 missing"), 0, &mut buf).expect("read");
+    assert_eq!(buf, d1, "/q/d2 not swapped @ {block_size}");
+
+    // Each '..' points at its (unchanged) parent name.
+    assert_eq!(resolve(&ext4, "/p/d1/..").unwrap(), resolve(&ext4, "/p").unwrap(), "p/d1/.. @ {block_size}");
+    assert_eq!(resolve(&ext4, "/q/d2/..").unwrap(), resolve(&ext4, "/q").unwrap(), "q/d2/.. @ {block_size}");
+}
+
+#[test]
+fn rename_exchange_dirs_1k() {
+    rename_exchange_dirs(1024);
+}
+#[test]
+fn rename_exchange_dirs_4k() {
+    rename_exchange_dirs(4096);
+}
+
+/// Moving a directory into itself or one of its own descendants must fail with
+/// EINVAL and leave the tree intact (otherwise it would create a detached
+/// loop).
+fn rename_into_own_subtree(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rn_subtree");
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.dir_mk("/a").expect("mkdir a");
+        ext4.dir_mk("/a/b").expect("mkdir a/b");
+        let a = resolve(&ext4, "/a").unwrap();
+        let ab = resolve(&ext4, "/a/b").unwrap();
+
+        // Into itself.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "a", a as u64, "x", 0)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::EINVAL, "into-self errno @ {block_size}");
+
+        // Into a descendant.
+        let e = ext4
+            .fuse_rename(ROOT_INODE as u64, "a", ab as u64, "x", 0)
+            .unwrap_err();
+        assert_eq!(e.error(), Errno::EINVAL, "into-descendant errno @ {block_size}");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(resolve(&ext4, "/a/b").is_some(), "/a/b vanished @ {block_size}");
+}
+
+#[test]
+fn rename_into_own_subtree_1k() {
+    rename_into_own_subtree(1024);
+}
+#[test]
+fn rename_into_own_subtree_4k() {
+    rename_into_own_subtree(4096);
+}
+
 #[test]
 fn symlink_fast_1k() {
     symlink_roundtrip(1024, "symlink_fast", FAST_TARGET);

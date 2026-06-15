@@ -561,8 +561,187 @@ impl Ext4 {
     }
 
     /// Rename a file.
-    fn fuse_rename(&mut self, parent: u64, name: &str, newparent: u64, newname: &str, flags: u32) {
-        unimplemented!();
+    pub fn fuse_rename(
+        &mut self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        flags: u32,
+    ) -> Result<usize> {
+        let old_parent = parent as u32;
+        let new_parent = newparent as u32;
+
+        // Source must exist.
+        let mut src = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.dir_find_entry(old_parent, name, &mut src)?;
+        let src_ino = src.dentry.inode;
+        let src_ref = self.get_inode_ref(src_ino);
+        let src_is_dir = src_ref.inode.is_dir();
+
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+
+        // A directory cannot be moved into itself or one of its descendants -
+        // that would detach the subtree into a loop.
+        if src_is_dir && self.dir_is_ancestor(src_ino, new_parent) {
+            return_errno!(Errno::EINVAL);
+        }
+
+        // RENAME_EXCHANGE atomically swaps two existing names; handled wholly
+        // on its own since it frees nothing and touches both entries.
+        if flags & RENAME_EXCHANGE != 0 {
+            return self.rename_exchange(old_parent, name, src_ino, src_is_dir, new_parent, newname);
+        }
+
+        // Examine the destination name, if it already exists.
+        let mut dst = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        if self.dir_find_entry(new_parent, newname, &mut dst).is_ok() {
+            // RENAME_NOREPLACE refuses to clobber an existing destination.
+            if flags & RENAME_NOREPLACE != 0 {
+                return_errno!(Errno::EEXIST);
+            }
+
+            let dst_ino = dst.dentry.inode;
+
+            // Renaming a name onto itself (same inode) is a no-op.
+            if dst_ino == src_ino {
+                return Ok(EOK);
+            }
+
+            let dst_is_dir = self.get_inode_ref(dst_ino).inode.is_dir();
+
+            // POSIX type compatibility between the two names.
+            if dst_is_dir && !src_is_dir {
+                return_errno!(Errno::EISDIR);
+            }
+            if !dst_is_dir && src_is_dir {
+                return_errno!(Errno::ENOTDIR);
+            }
+
+            // Free the destination name so the source can take it. These checks
+            // run before any mutation, so a rejected rename leaves the image
+            // untouched.
+            if dst_is_dir {
+                // dir_remove enforces ENOTEMPTY and drops the removed
+                // directory's '..' credit from new_parent.
+                self.dir_remove(new_parent, newname)?;
+            } else {
+                self.fuse_unlink(new_parent as u64, newname)?;
+            }
+        }
+
+        // Point a new entry at the source inode under the new name. dir_add_entry
+        // does not touch link counts, and may grow the parent directory, so the
+        // parent inode must be written back afterwards.
+        let mut np = self.get_inode_ref(new_parent);
+        self.dir_add_entry(&mut np, &src_ref, newname)?;
+        self.write_back_inode(&mut np);
+
+        // Drop the old name. dir_remove_entry leaves the inode's link count
+        // alone, so the moved inode keeps exactly one reference.
+        let mut op = self.get_inode_ref(old_parent);
+        self.dir_remove_entry(&mut op, name)?;
+        self.write_back_inode(&mut op);
+
+        // Moving a directory to a different parent: its ".." back-reference now
+        // points at the wrong directory. Repoint it, and move the subdirectory
+        // link credit from the old parent to the new one.
+        if src_is_dir && old_parent != new_parent {
+            self.dir_set_entry_target(src_ino, "..", new_parent)?;
+            self.adjust_dir_links(old_parent, -1)?;
+            self.adjust_dir_links(new_parent, 1)?;
+        }
+
+        Ok(EOK)
+    }
+
+    /// True if `ancestor` is `start` itself or any directory above it, walking
+    /// up through '..'. Used to reject moving a directory into its own subtree.
+    fn dir_is_ancestor(&self, ancestor: u32, start: u32) -> bool {
+        let mut cur = start;
+        loop {
+            if cur == ancestor {
+                return true;
+            }
+            if cur == ROOT_INODE {
+                return false;
+            }
+            let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+            if self.dir_find_entry(cur, "..", &mut res).is_err() {
+                return false;
+            }
+            let parent = res.dentry.inode;
+            // Root's '..' points to itself; stop rather than loop forever.
+            if parent == cur {
+                return false;
+            }
+            cur = parent;
+        }
+    }
+
+    /// Add `delta` (which may be negative) to a directory's link count and
+    /// persist it. Used to move subdirectory '..' credit between parents.
+    fn adjust_dir_links(&self, ino: u32, delta: i64) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let mut r = self.get_inode_ref(ino);
+        let new = (r.inode.links_count() as i64 + delta).max(0) as u16;
+        r.inode.set_links_count(new);
+        self.write_back_inode(&mut r);
+        Ok(())
+    }
+
+    /// RENAME_EXCHANGE: atomically swap which inode the two names refer to. Both
+    /// names must exist; nothing is created or freed. The directory entries stay
+    /// in their parents - only their target inode (and stored type) is swapped -
+    /// so for directories that change parent we repoint '..' and move the
+    /// subdirectory link credit between the parents.
+    fn rename_exchange(
+        &mut self,
+        old_parent: u32,
+        name: &str,
+        src_ino: u32,
+        src_is_dir: bool,
+        new_parent: u32,
+        newname: &str,
+    ) -> Result<usize> {
+        // The partner name must exist.
+        let mut dst = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.dir_find_entry(new_parent, newname, &mut dst)?;
+        let dst_ino = dst.dentry.inode;
+
+        // Exchanging a name with itself is a no-op.
+        if dst_ino == src_ino {
+            return Ok(EOK);
+        }
+        let dst_is_dir = self.get_inode_ref(dst_ino).inode.is_dir();
+
+        // Neither directory may be swapped into its own subtree.
+        if dst_is_dir && self.dir_is_ancestor(dst_ino, old_parent) {
+            return_errno!(Errno::EINVAL);
+        }
+
+        // Swap the targets in place.
+        self.dir_set_entry_target(old_parent, name, dst_ino)?;
+        self.dir_set_entry_target(new_parent, newname, src_ino)?;
+
+        // When the two names live in different directories, each directory that
+        // moved needs its '..' repointed, and each parent's link count adjusted
+        // by what it gained minus what it lost.
+        if old_parent != new_parent {
+            if src_is_dir {
+                self.dir_set_entry_target(src_ino, "..", new_parent)?;
+            }
+            if dst_is_dir {
+                self.dir_set_entry_target(dst_ino, "..", old_parent)?;
+            }
+            self.adjust_dir_links(old_parent, dst_is_dir as i64 - src_is_dir as i64)?;
+            self.adjust_dir_links(new_parent, src_is_dir as i64 - dst_is_dir as i64)?;
+        }
+
+        Ok(EOK)
     }
 
     /// Flush method.

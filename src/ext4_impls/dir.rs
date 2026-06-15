@@ -423,6 +423,37 @@ impl Ext4 {
         Ok(EOK)
     }
 
+    /// Repoint an existing directory entry at a different inode, updating the
+    /// stored file-type byte to match. The entry keeps its name and position;
+    /// only its target changes. Used by rename to retarget a '..' back-reference
+    /// and to swap two names with RENAME_EXCHANGE.
+    pub fn dir_set_entry_target(
+        &self,
+        parent_ino: u32,
+        name: &str,
+        target_ino: u32,
+    ) -> Result<usize> {
+        let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.dir_find_entry(parent_ino, name, &mut res)?;
+
+        let de_type = de_type_from_inode(&self.get_inode_ref(target_ino).inode);
+
+        let mut blk = Block::load(
+            &self.block_device,
+            res.pblock_id * self.block_size(),
+            self.block_size(),
+        );
+        let de: &mut Ext4DirEntry = blk.read_offset_as_mut(res.offset);
+        de.inode = target_ino;
+        de.inner.inode_type = de_type.bits();
+
+        let gen = self.get_inode_ref(parent_ino).inode.generation();
+        self.dir_set_csum(&mut blk, gen);
+        blk.sync_blk_to_disk(&self.block_device);
+
+        Ok(EOK)
+    }
+
     pub fn dir_has_entry(&self, dir_inode: u32) -> bool {
         // load parent inode
         let parent = self.get_inode_ref(dir_inode);
