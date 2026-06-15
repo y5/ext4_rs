@@ -165,8 +165,9 @@ impl Ext4Superblock {
         block_group_count as u32
     }
 
-    pub fn blocks_count(&self) -> u32 {
-        ((self.blocks_count_hi.to_le() as u64) << 32) as u32 | self.blocks_count_lo
+    pub fn blocks_count(&self) -> u64 {
+        // _hi is the high 32 bits of a 64-bit count; the old u32 return truncated it.
+        ((self.blocks_count_hi as u64) << 32) | self.blocks_count_lo as u64
     }
 
     pub fn desc_size(&self) -> u16 {
@@ -188,19 +189,24 @@ impl Ext4Superblock {
         let inodes_per_group = self.inodes_per_group;
 
         let total_inodes = self.inodes_count;
-        if bgid < block_group_count - 1 {
+        if bgid + 1 < block_group_count {
             inodes_per_group
         } else {
-            total_inodes - ((block_group_count - 1) * inodes_per_group)
+            total_inodes.saturating_sub(block_group_count.saturating_sub(1) * inodes_per_group)
         }
     }
 
     pub fn decrease_free_inodes_count(&mut self) {
-        self.free_inodes_count -= 1;
+        self.free_inodes_count = self.free_inodes_count.saturating_sub(1);
+    }
+
+    pub fn increase_free_inodes_count(&mut self) {
+        self.free_inodes_count = self.free_inodes_count.saturating_add(1);
     }
 
     pub fn free_blocks_count(&self) -> u64 {
-        self.free_blocks_count_lo as u64 | ((self.free_blocks_count_hi as u64) << 32).to_le()
+        // _lo/_hi are the low/high 32 bits of a 64-bit count.
+        self.free_blocks_count_lo as u64 | ((self.free_blocks_count_hi as u64) << 32)
     }
 
     pub fn set_free_blocks_count(&mut self, free_blocks: u64) {
