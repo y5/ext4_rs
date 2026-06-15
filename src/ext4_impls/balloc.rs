@@ -281,9 +281,11 @@ impl Ext4 {
     ) -> Result<Ext4Fsblk> {
         let mut alloc: Ext4Fsblk = 0;
         let super_block = &self.super_block;
+        // The valid in-group index range is blocks_per_group; the bitmap block
+        // holds BLOCK_SIZE*8 bits but the trailing ones are padding. Capping at
+        // the bit capacity would scan/allocate dead bits when a custom group
+        // size makes blocks_per_group smaller.
         let blocks_per_group = super_block.blocks_per_group();
-        // Maximum number of blocks that can be represented by a bitmap block
-        let max_blocks_in_bitmap = BLOCK_SIZE * 8;
 
         let mut bgid = *start_bgid;
         let mut idx_in_bg = 0;
@@ -321,7 +323,7 @@ impl Ext4 {
             }
 
             // Ensure idx_in_bg doesn't exceed bitmap size
-            if idx_in_bg >= max_blocks_in_bitmap as u32 {
+            if idx_in_bg >= blocks_per_group {
                 // Try next block group if we've reached the end of this bitmap
                 bgid = (bgid + 1) % block_group_count;
                 count -= 1;
@@ -350,7 +352,7 @@ impl Ext4 {
             }
 
             // Try to find free block near to goal
-            let end_idx = min((idx_in_bg + 63) & !63, max_blocks_in_bitmap as u32);
+            let end_idx = min((idx_in_bg + 63) & !63, blocks_per_group);
 
             for tmp_idx in (idx_in_bg + 1)..end_idx {
                 if ext4_bmap_is_bit_clr(&bitmap_block.data, tmp_idx) {
@@ -377,7 +379,7 @@ impl Ext4 {
             if ext4_bmap_bit_find_clr(
                 &bitmap_block.data,
                 idx_in_bg,
-                max_blocks_in_bitmap as u32,
+                blocks_per_group,
                 &mut rel_blk_idx,
             ) {
                 // Check if this is a system reserved block
