@@ -109,10 +109,24 @@ impl Ext4 {
     }
 
     /// Read symbolic link.
-    fn fuse_readlink(&mut self, ino: u64) -> Result<Vec<u8>> {
+    pub fn fuse_readlink(&mut self, ino: u64) -> Result<Vec<u8>> {
         let inode_ref = self.get_inode_ref(ino as u32);
-        let file_size = inode_ref.inode.size();
-        let mut read_buf = vec![0; file_size as usize];
+        let file_size = inode_ref.inode.size() as usize;
+
+        // Fast symlink: the target lives inline in the inode block area with no
+        // data blocks allocated. read_at would misread the block array as an
+        // extent tree, so unpack it directly here.
+        if inode_ref.inode.blocks_count() == 0 {
+            let block = inode_ref.inode.block();
+            let mut raw = [0u8; 15 * 4];
+            for (i, word) in block.iter().enumerate() {
+                raw[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            return Ok(raw[..file_size].to_vec());
+        }
+
+        // Slow symlink: the target is stored as ordinary file data.
+        let mut read_buf = vec![0; file_size];
         let read_size = self.read_at(ino as u32, 0, &mut read_buf)?;
         Ok(read_buf)
     }
@@ -261,7 +275,52 @@ impl Ext4 {
         mode |= file_type.bits();
 
         let inode_ref = self.create(parent as u32, link_name, mode)?;
+        self.write_symlink_target(inode_ref.inode_num, target)?;
+
         Ok(EOK)
+    }
+
+    /// Store a symlink's target on disk. Targets shorter than 60 bytes are kept
+    /// inline in the inode's block area ("fast symlink", no data blocks);
+    /// longer ones spill into a data block ("slow symlink"). This matches what
+    /// the kernel writes and what e2fsck expects.
+    fn write_symlink_target(&self, ino: u32, target: &str) -> Result<()> {
+        let bytes = target.as_bytes();
+
+        // The inode block area is 15 * 4 = 60 bytes.
+        const INLINE_CAP: usize = 15 * 4;
+
+        if bytes.len() < INLINE_CAP {
+            let mut inode_ref = self.get_inode_ref(ino);
+
+            // create() set the extents flag and an extent header in the block
+            // area; a fast symlink uses neither, and e2fsck rejects EXTENT_FL
+            // on a fast symlink.
+            let flags = inode_ref.inode.flags() & !(EXT4_INODE_FLAG_EXTENTS as u32);
+            inode_ref.inode.set_flags(flags);
+
+            // Pack the target bytes (little-endian, on-disk order) into the
+            // 15-word block array, zero-padding the rest.
+            let mut raw = [0u8; INLINE_CAP];
+            raw[..bytes.len()].copy_from_slice(bytes);
+            let mut block = [0u32; 15];
+            for (i, word) in block.iter_mut().enumerate() {
+                let b = i * 4;
+                *word = u32::from_le_bytes([raw[b], raw[b + 1], raw[b + 2], raw[b + 3]]);
+            }
+            inode_ref.inode.set_block(block);
+            inode_ref.inode.set_size(bytes.len() as u64);
+            inode_ref.inode.set_blocks_count(0);
+
+            self.write_back_inode(&mut inode_ref);
+        } else {
+            // Slow symlink: keep the extent tree create() set up and write the
+            // target as ordinary file data; write_at allocates the block and
+            // records the size.
+            self.write_at(ino, 0, bytes)?;
+        }
+
+        Ok(())
     }
     /// Create a hard link.
     /// Params:

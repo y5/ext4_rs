@@ -545,3 +545,56 @@ fn rmdir_1k() {
 fn rmdir_4k() {
     rmdir_roundtrip(4096);
 }
+
+/// Create a symlink with the crate, require e2fsck to be clean, then reopen and
+/// read the target back via readlink. A target under 60 bytes must be stored
+/// inline in the inode (fast symlink); a longer target lives in a data block
+/// (slow symlink). Either way readlink must return exactly the bytes given.
+fn symlink_roundtrip(block_size: u32, tag: &str, target: &str) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, tag);
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.fuse_symlink(ROOT_INODE as u64, "link", target)
+            .expect("symlink");
+    }
+    fsck_clean(&img); // a freshly-created symlink must be a valid filesystem
+
+    let mut ext4 = open_fs(&img);
+    let ino = ext4
+        .generic_open("/link", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("resolve /link");
+    let got = ext4.fuse_readlink(ino as u64).expect("readlink /link");
+    assert_eq!(
+        got,
+        target.as_bytes(),
+        "symlink target mismatch @ {block_size} (target len {})",
+        target.len()
+    );
+}
+
+// Short target: fits inline in i_block (fast symlink).
+const FAST_TARGET: &str = "/etc/hostname";
+// Long target: 80 bytes, must spill to a data block (slow symlink).
+const SLOW_TARGET: &str =
+    "/very/long/path/that/exceeds/sixty/bytes/and/must/live/in/a/data/block/xxxxxxx";
+
+#[test]
+fn symlink_fast_1k() {
+    symlink_roundtrip(1024, "symlink_fast", FAST_TARGET);
+}
+#[test]
+fn symlink_fast_4k() {
+    symlink_roundtrip(4096, "symlink_fast", FAST_TARGET);
+}
+#[test]
+fn symlink_slow_1k() {
+    symlink_roundtrip(1024, "symlink_slow", SLOW_TARGET);
+}
+#[test]
+fn symlink_slow_4k() {
+    symlink_roundtrip(4096, "symlink_slow", SLOW_TARGET);
+}
