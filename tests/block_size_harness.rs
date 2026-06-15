@@ -126,6 +126,19 @@ fn fsck_clean(img: &Path) {
     );
 }
 
+/// Run a debugfs command against the image (read-write), returning stdout.
+fn debugfs(img: &Path, request: &str) -> String {
+    let out = Command::new("debugfs")
+        .arg("-w")
+        .arg("-R")
+        .arg(request)
+        .arg(img)
+        .output()
+        .expect("debugfs failed to spawn");
+    assert!(out.status.success(), "debugfs `{request}` failed");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Open the image with the crate, read `/probe.bin`, and assert the bytes match
 /// what debugfs wrote. This is the block-size-independent contract.
 fn read_probe_matches(block_size: u32) {
@@ -1227,3 +1240,53 @@ fn symlink_slow_4k() {
     symlink_roundtrip(4096, "symlink_slow", SLOW_TARGET);
 }
 
+
+// --- extended attributes ---
+
+/// debugfs writes attributes (a small one stored in the inode body, a large one
+/// spilled to a block); the crate must read both back, list them, and report
+/// ENODATA for a missing name.
+fn xattr_read(block_size: u32) {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image(block_size, "xattr_read");
+    let big = vec![b'A'; 200];
+    let bigfile = Path::new("target").join("harness").join("xbig.bin");
+    fs::write(&bigfile, &big).unwrap();
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.create(ROOT_INODE, "x.bin", reg_mode()).expect("create");
+    }
+    debugfs(&img, "ea_set /x.bin user.foo barbar");
+    debugfs(&img, "ea_set /x.bin trusted.t hello");
+    debugfs(&img, &format!("ea_set -f {} /x.bin user.big", bigfile.display()));
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let ino = resolve(&ext4, "/x.bin").expect("resolve");
+
+    assert_eq!(ext4.xattr_get(ino, "user.foo").unwrap(), b"barbar", "user.foo @ {block_size}");
+    assert_eq!(ext4.xattr_get(ino, "trusted.t").unwrap(), b"hello", "trusted.t @ {block_size}");
+    assert_eq!(ext4.xattr_get(ino, "user.big").unwrap(), big, "user.big @ {block_size}");
+
+    let mut names = ext4.xattr_list(ino).unwrap();
+    names.sort();
+    assert_eq!(names, vec!["trusted.t", "user.big", "user.foo"], "list @ {block_size}");
+
+    assert_eq!(
+        ext4.xattr_get(ino, "user.missing").unwrap_err().error(),
+        Errno::ENODATA,
+        "missing @ {block_size}"
+    );
+}
+
+#[test]
+fn xattr_read_1k() {
+    xattr_read(1024);
+}
+#[test]
+fn xattr_read_4k() {
+    xattr_read(4096);
+}

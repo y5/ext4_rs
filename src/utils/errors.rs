@@ -31,8 +31,10 @@ pub enum Errno {
     EROFS = 30,        /* Read-only file system */
     EMLINK = 31,       /* Too many links */
     EPIPE = 32,        /* Broken pipe */
+    ERANGE = 34,       /* Math result not representable / buffer too small */
     ENAMETOOLONG = 36, /* File name too long */
     ENOTEMPTY = 39,    /* Directory not empty */
+    ENODATA = 61,      /* No data available (no such xattr) */
     ENOTSUP = 95,      /* Not supported */
 }
 

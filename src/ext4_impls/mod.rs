@@ -5,6 +5,7 @@ pub mod extents;
 pub mod file;
 pub mod ialloc;
 pub mod inode;
+pub mod xattr;
 
 pub use balloc::*;
 pub use dir::*;
@@ -13,3 +14,4 @@ pub use extents::*;
 pub use file::*;
 pub use ialloc::*;
 pub use inode::*;
+pub use xattr::*;
