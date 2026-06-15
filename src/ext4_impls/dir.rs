@@ -489,20 +489,28 @@ impl Ext4 {
         let mut parent_inode_ref = self.get_inode_ref(parent);
         let mut child_inode_ref = self.get_inode_ref(search_result.dentry.inode);
 
+        // Only empty directories (containing just '.' and '..') can be removed.
         if self.dir_has_entry(child_inode_ref.inode_num) {
             return_errno_with_message!(Errno::ENOTSUP, "rm dir with children not supported")
         }
 
+        // Remove the entry from the parent directory.
+        self.dir_remove_entry(&mut parent_inode_ref, path)?;
+
+        // Free the directory's data block (the '.'/'..' block).
         self.truncate_inode(&mut child_inode_ref, 0)?;
 
-        self.unlink(&mut parent_inode_ref, &mut child_inode_ref, path)?;
+        // A removed empty directory loses both the parent's entry and its own
+        // '.' self-link, so its link count drops to zero. Reset the inode to the
+        // unused state and release it from the inode bitmap.
+        child_inode_ref.inode = Ext4Inode::default();
+        self.write_back_inode_without_csum(&child_inode_ref);
+        self.ialloc_free_inode(child_inode_ref.inode_num, true);
 
+        // The parent loses the '..' back-reference from the removed subdirectory.
+        let parent_links = parent_inode_ref.inode.links_count().saturating_sub(1);
+        parent_inode_ref.inode.set_links_count(parent_links);
         self.write_back_inode(&mut parent_inode_ref);
-
-        // to do
-        // ext4_inode_set_del_time
-        // ext4_inode_set_links_cnt
-        // ext4_fs_free_inode(&child)
 
         Ok(EOK)
     }
