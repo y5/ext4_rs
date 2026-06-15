@@ -13,6 +13,7 @@
 use crate::ext4_defs::*;
 use crate::prelude::*;
 use crate::return_errno_with_message;
+use crate::utils::*;
 
 /// Identifies an xattr header (both ibody and block).
 pub const EXT4_XATTR_MAGIC: u32 = 0xEA02_0000;
@@ -82,6 +83,79 @@ fn serialize_region(attrs: &[ParsedXattr], region_len: usize) -> Option<Vec<u8>>
     }
     // The terminating zero entry is already present (region is zero-filled).
     Some(region)
+}
+
+/// Entry hash stored in `e_hash`: fold in the name (one byte at a time), then
+/// the value padded to a multiple of 4 and read as little-endian u32 words —
+/// the algorithm e2fsck validates against. Attribute names are ASCII, so the
+/// historical signed-char ambiguity in the name loop doesn't arise.
+fn hash_entry(name: &[u8], value: &[u8]) -> u32 {
+    const NAME_SHIFT: u32 = 5;
+    const VALUE_SHIFT: u32 = 16;
+    let mut hash: u32 = 0;
+    for &c in name {
+        hash = (hash << NAME_SHIFT) ^ (hash >> (32 - NAME_SHIFT)) ^ (c as u32);
+    }
+    if !value.is_empty() {
+        let mut v = value.to_vec();
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        for chunk in v.chunks_exact(4) {
+            let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            hash = (hash << VALUE_SHIFT) ^ (hash >> (32 - VALUE_SHIFT)) ^ w;
+        }
+    }
+    hash
+}
+
+/// Serialize attributes into a full external xattr block: a 32-byte header
+/// (magic, refcount=1, blocks=1, zero hash, zero checksum) followed by the
+/// entry array and values (`e_value_offs` measured from the block start). The
+/// `h_checksum` is filled in by the caller. Returns None if they don't fit.
+fn serialize_block(attrs: &[ParsedXattr], block_size: usize) -> Option<Vec<u8>> {
+    let mut block = vec![0u8; block_size];
+    block[0..4].copy_from_slice(&EXT4_XATTR_MAGIC.to_le_bytes());
+    block[4..8].copy_from_slice(&1u32.to_le_bytes()); // h_refcount
+    block[8..12].copy_from_slice(&1u32.to_le_bytes()); // h_blocks
+    // h_hash (12..16), h_checksum (16..20), reserved (20..32) stay 0.
+
+    let mut sorted: Vec<&ParsedXattr> = attrs.iter().collect();
+    sorted.sort_by(|a, b| (a.name_index, &a.name).cmp(&(b.name_index, &b.name)));
+
+    let mut entry_off = BLOCK_HDR;
+    let mut value_end = block_size;
+
+    for a in sorted {
+        let elen = entry_len(a.name.len());
+        let vpad = value_pad(a.value.len());
+        if entry_off + elen + 4 > value_end.saturating_sub(vpad) {
+            return None;
+        }
+
+        let e_value_offs = if a.value.is_empty() {
+            0u16
+        } else {
+            let voff = value_end - vpad;
+            block[voff..voff + a.value.len()].copy_from_slice(&a.value);
+            value_end = voff;
+            voff as u16
+        };
+
+        block[entry_off] = a.name.len() as u8;
+        block[entry_off + 1] = a.name_index;
+        block[entry_off + 2..entry_off + 4].copy_from_slice(&e_value_offs.to_le_bytes());
+        // e_value_inum (4) stays 0
+        block[entry_off + 8..entry_off + 12]
+            .copy_from_slice(&(a.value.len() as u32).to_le_bytes());
+        block[entry_off + 12..entry_off + 16]
+            .copy_from_slice(&hash_entry(&a.name, &a.value).to_le_bytes());
+        block[entry_off + ENTRY_FIXED..entry_off + ENTRY_FIXED + a.name.len()]
+            .copy_from_slice(&a.name);
+
+        entry_off += elen;
+    }
+    Some(block)
 }
 
 /// Map a name prefix to its on-disk `e_name_index` and the remaining suffix.
@@ -282,6 +356,8 @@ impl Ext4 {
         let mut inode_ref = self.get_inode_ref(ino);
         let (off, inode_size) = match self.ibody_geometry(&inode_ref.inode) {
             Some(g) => g,
+            // No in-inode xattr space: nothing to clear; only a real store fails.
+            None if attrs.is_empty() => return Ok(()),
             None => return_errno_with_message!(Errno::ENOSPC, "inode has no xattr space"),
         };
         let inode_pos = self.inode_disk_pos(ino);
@@ -319,8 +395,7 @@ impl Ext4 {
             None => return_errno_with_message!(Errno::ENOTSUP, "unsupported xattr namespace"),
         };
 
-        let inode = self.get_inode_ref(ino).inode;
-        let mut attrs = self.read_ibody_attrs(ino, &inode);
+        let mut attrs = self.xattr_collect(ino);
         let exists = attrs
             .iter()
             .any(|a| a.name_index == idx && a.name == suffix.as_bytes());
@@ -339,7 +414,7 @@ impl Ext4 {
             value: value.to_vec(),
         });
 
-        self.write_ibody_attrs(ino, &attrs)
+        self.xattr_store(ino, attrs)
     }
 
     /// Remove an extended attribute, or ENODATA if it is not present.
@@ -349,14 +424,100 @@ impl Ext4 {
             None => return_errno_with_message!(Errno::ENODATA, "unsupported xattr namespace"),
         };
 
-        let inode = self.get_inode_ref(ino).inode;
-        let mut attrs = self.read_ibody_attrs(ino, &inode);
+        let mut attrs = self.xattr_collect(ino);
         let before = attrs.len();
         attrs.retain(|a| !(a.name_index == idx && a.name == suffix.as_bytes()));
         if attrs.len() == before {
             return_errno_with_message!(Errno::ENODATA, "no such xattr");
         }
 
-        self.write_ibody_attrs(ino, &attrs)
+        self.xattr_store(ino, attrs)
+    }
+
+    /// Persist the full attribute set, choosing storage: the inode body if
+    /// everything fits and no external block is in use, otherwise the external
+    /// block. An empty set clears both and frees the block.
+    fn xattr_store(&self, ino: u32, attrs: Vec<ParsedXattr>) -> Result<()> {
+        let inode = self.get_inode_ref(ino).inode;
+        let has_block = self.xattr_block_of(&inode) != 0;
+
+        if attrs.is_empty() {
+            self.write_ibody_attrs(ino, &[])?;
+            if has_block {
+                self.free_xattr_block(ino)?;
+            }
+            return Ok(());
+        }
+
+        let fits_ibody = !has_block
+            && match self.ibody_geometry(&inode) {
+                Some((off, inode_size)) => {
+                    serialize_region(&attrs, inode_size - off - 4).is_some()
+                }
+                None => false,
+            };
+
+        if fits_ibody {
+            self.write_ibody_attrs(ino, &attrs)
+        } else {
+            // Everything lives in the block; keep the body clear.
+            self.write_ibody_attrs(ino, &[])?;
+            self.write_block_attrs(ino, &attrs)
+        }
+    }
+
+    /// crc32c of an external xattr block (uuid seed + block number + block with
+    /// the checksum field zeroed). Zero when metadata checksums are disabled.
+    fn xattr_block_checksum(&self, block_nr: u64, block: &[u8]) -> u32 {
+        if self.super_block.features_read_only & 0x400 == 0 {
+            return 0;
+        }
+        let uuid = &self.super_block.uuid;
+        let seed = ext4_crc32c(EXT4_CRC32_INIT, uuid, uuid.len() as u32);
+        let mut c = ext4_crc32c(seed, &block_nr.to_le_bytes(), 8);
+        // Header up to h_checksum, then the zeroed checksum field, then the rest.
+        c = ext4_crc32c(c, &block[0..16], 16);
+        c = ext4_crc32c(c, &[0u8; 4], 4);
+        c = ext4_crc32c(c, &block[20..], (block.len() - 20) as u32);
+        c
+    }
+
+    /// Write the whole attribute set into the external block (allocating it on
+    /// first use), and point the inode at it.
+    fn write_block_attrs(&self, ino: u32, attrs: &[ParsedXattr]) -> Result<()> {
+        let bs = self.block_size();
+        let mut block = match serialize_block(attrs, bs) {
+            Some(b) => b,
+            None => return_errno_with_message!(Errno::ENOSPC, "xattrs do not fit in a block"),
+        };
+
+        let mut inode_ref = self.get_inode_ref(ino);
+        let mut blk = self.xattr_block_of(&inode_ref.inode);
+        if blk == 0 {
+            blk = self.balloc_alloc_block(&mut inode_ref, None)?;
+            inode_ref.inode.file_acl = blk as u32;
+            inode_ref.inode.osd2.l_i_file_acl_high = (blk >> 32) as u16;
+        }
+
+        let csum = self.xattr_block_checksum(blk, &block);
+        block[16..20].copy_from_slice(&csum.to_le_bytes());
+        self.block_device.write_offset(blk as usize * bs, &block);
+
+        self.write_back_inode(&mut inode_ref);
+        Ok(())
+    }
+
+    /// Free the external xattr block and clear the inode's pointer to it.
+    fn free_xattr_block(&self, ino: u32) -> Result<()> {
+        let mut inode_ref = self.get_inode_ref(ino);
+        let blk = self.xattr_block_of(&inode_ref.inode);
+        if blk == 0 {
+            return Ok(());
+        }
+        inode_ref.inode.file_acl = 0;
+        inode_ref.inode.osd2.l_i_file_acl_high = 0;
+        self.write_back_inode(&mut inode_ref);
+        self.balloc_free_blocks(&mut inode_ref, blk, 1);
+        Ok(())
     }
 }

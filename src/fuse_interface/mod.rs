@@ -810,29 +810,51 @@ impl Ext4 {
     }
 
     /// Set an extended attribute.
-    fn fuse_setxattr(&mut self, ino: u64, name: &str, _value: &[u8], flags: i32, position: u32) {
-        unimplemented!();
+    pub fn fuse_setxattr(
+        &mut self,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+    ) -> Result<usize> {
+        self.xattr_set(ino as u32, name, value, flags)?;
+        Ok(EOK)
     }
 
     /// Get an extended attribute.
-    /// If `size` is 0, the size of the value should be sent with `reply.size()`.
-    /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
-    /// `reply.error(ERANGE)` if it doesn't.
-    fn fuse_getxattr(&mut self, ino: u64, name: &str, size: u32) {
-        unimplemented!();
+    /// With `size == 0`, returns just the value's length (so the caller can size
+    /// its buffer); otherwise returns the value, or ERANGE if it doesn't fit.
+    pub fn fuse_getxattr(&mut self, ino: u64, name: &str, size: u32) -> Result<Vec<u8>> {
+        let value = self.xattr_get(ino as u32, name)?;
+        if size == 0 {
+            return Ok(value); // caller inspects the length
+        }
+        if value.len() > size as usize {
+            return_errno!(Errno::ERANGE);
+        }
+        Ok(value)
     }
 
-    /// List extended attribute names.
-    /// If `size` is 0, the size of the value should be sent with `reply.size()`.
-    /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
-    /// `reply.error(ERANGE)` if it doesn't.
-    fn fuse_listxattr(&mut self, ino: u64, size: u32) {
-        unimplemented!();
+    /// List extended attribute names as a NUL-terminated, NUL-separated buffer.
+    /// With `size == 0`, returns the buffer so the caller can read its length;
+    /// otherwise returns it only if it fits, else ERANGE.
+    pub fn fuse_listxattr(&mut self, ino: u64, size: u32) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        for name in self.xattr_list(ino as u32)? {
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(0);
+        }
+        if size != 0 && buf.len() > size as usize {
+            return_errno!(Errno::ERANGE);
+        }
+        Ok(buf)
     }
 
     /// Remove an extended attribute.
-    fn fuse_removexattr(&mut self, ino: u64, name: &str) {
-        unimplemented!();
+    pub fn fuse_removexattr(&mut self, ino: u64, name: &str) -> Result<usize> {
+        self.xattr_remove(ino as u32, name)?;
+        Ok(EOK)
     }
 
     /// Test for a POSIX file lock.

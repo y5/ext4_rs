@@ -1365,3 +1365,73 @@ fn xattr_write_ibody_1k() {
 fn xattr_write_ibody_4k() {
     xattr_write_ibody(4096);
 }
+
+/// The crate stores attributes in an external block when they overflow the
+/// inode body (a large value, and many small ones). e2fsck validates the block
+/// (header, hashes, checksum); debugfs and the crate read them back. Removing
+/// everything frees the block and clears i_file_acl.
+fn xattr_block(block_size: u32) {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image(block_size, "xattr_blk");
+    let big = vec![b'Z'; 300];
+
+    let ino;
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "x.bin", reg_mode()).expect("create");
+        ino = f.inode_num;
+        ext4.xattr_set(ino, "user.big", &big, 0).expect("set big");
+        // Several small attrs that, together, overflow the inode body.
+        for i in 0..8 {
+            ext4.xattr_set(ino, &format!("user.k{i}"), format!("val{i}").as_bytes(), 0)
+                .expect("set small");
+        }
+        // The block must actually be in use.
+        assert_ne!(
+            ext4.get_inode_ref(ino).inode.file_acl,
+            0,
+            "expected an external xattr block @ {block_size}"
+        );
+    }
+    fsck_clean(&img);
+
+    let listed = debugfs(&img, "ea_list /x.bin");
+    assert!(listed.contains("user.big"), "debugfs missing user.big @ {block_size}:\n{listed}");
+    assert!(listed.contains("user.k7"), "debugfs missing user.k7 @ {block_size}:\n{listed}");
+
+    {
+        let ext4 = open_fs(&img);
+        assert_eq!(ext4.xattr_get(ino, "user.big").unwrap(), big, "big value @ {block_size}");
+        assert_eq!(ext4.xattr_get(ino, "user.k3").unwrap(), b"val3", "k3 @ {block_size}");
+        assert_eq!(ext4.xattr_list(ino).unwrap().len(), 9, "count @ {block_size}");
+    }
+
+    // Remove everything; the block must be freed and i_file_acl cleared.
+    {
+        let ext4 = open_fs(&img);
+        ext4.xattr_remove(ino, "user.big").expect("rm big");
+        for i in 0..8 {
+            ext4.xattr_remove(ino, &format!("user.k{i}")).expect("rm small");
+        }
+        assert_eq!(
+            ext4.get_inode_ref(ino).inode.file_acl,
+            0,
+            "xattr block not freed @ {block_size}"
+        );
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(ext4.xattr_list(ino).unwrap().is_empty(), "attrs remain @ {block_size}");
+}
+
+#[test]
+fn xattr_block_1k() {
+    xattr_block(1024);
+}
+#[test]
+fn xattr_block_4k() {
+    xattr_block(4096);
+}
