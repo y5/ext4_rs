@@ -389,3 +389,36 @@ fn delete_1k() {
 fn delete_4k() {
     delete_clean(4096);
 }
+
+/// Make an empty directory, remove it, and confirm consistency at each step.
+fn rmdir_roundtrip(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rmdir");
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.dir_mk("/rmd").expect("mkdir /rmd");
+    }
+    fsck_clean(&img); // a freshly-created empty directory must be valid
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.dir_remove(ROOT_INODE, "rmd").expect("rmdir /rmd");
+    }
+    fsck_clean(&img); // removing it must leave the filesystem consistent
+
+    let ext4 = open_fs(&img);
+    let r = ext4.generic_open("/rmd", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+    assert!(r.is_err(), "removed dir still resolves @ {block_size}");
+}
+
+#[test]
+fn rmdir_1k() {
+    rmdir_roundtrip(1024);
+}
+#[test]
+fn rmdir_4k() {
+    rmdir_roundtrip(4096);
+}
