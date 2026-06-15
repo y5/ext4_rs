@@ -64,7 +64,7 @@ impl Default for FileAttr {
 }
 
 impl FileAttr {
-    pub fn from_inode_ref(inode_ref: &Ext4InodeRef) -> FileAttr {
+    pub fn from_inode_ref(inode_ref: &Ext4InodeRef, block_size: u32) -> FileAttr {
         let inode_num = inode_ref.inode_num;
         let inode = inode_ref.inode;
         FileAttr {
@@ -84,7 +84,7 @@ impl FileAttr {
             uid: inode.uid() as u32,
             gid: inode.gid() as u32,
             rdev: inode.faddr(),
-            blksize: BLOCK_SIZE as u32,
+            blksize: block_size,
             flags: inode.flags(),
         }
     }
@@ -135,7 +135,7 @@ pub struct LinuxStat {
 }
 
 impl LinuxStat {
-    pub fn from_inode_ref(inode_ref: &Ext4InodeRef) -> LinuxStat {
+    pub fn from_inode_ref(inode_ref: &Ext4InodeRef, block_size: u32) -> LinuxStat {
         let inode_num = inode_ref.inode_num;
         let inode = &inode_ref.inode;
 
@@ -148,7 +148,7 @@ impl LinuxStat {
             st_gid: inode.gid(),
             st_rdev: 0,
             st_size: inode.size() as u32,
-            st_blksize: 4096, // Block size assumed to be 4096 bytes
+            st_blksize: block_size,
             st_blocks: inode.blocks_count() as u32,
             st_atime: inode.atime(),
             st_atime_nsec: 0,

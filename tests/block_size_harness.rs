@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use ext4_rs::{BlockDevice, Ext4};
+use ext4_rs::{BlockDevice, Ext4, InodeFileType};
 
 const ROOT_INODE: u32 = 2;
 
@@ -68,14 +68,13 @@ fn tool_missing(name: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Build a fresh image at `block_size`, with a single known file written via
-/// debugfs at `/probe.bin`. Returns the image path and the expected contents.
-fn make_image(block_size: u32, probe_len: usize) -> (PathBuf, Vec<u8>) {
+/// Create a fresh, empty ext4 image at `block_size`. `tag` keeps parallel
+/// tests from sharing a path.
+fn fresh_image(block_size: u32, tag: &str) -> PathBuf {
     let dir = Path::new("target").join("harness");
     fs::create_dir_all(&dir).unwrap();
 
-    let img = dir.join(format!("fixture_{}.img", block_size));
-    let probe = dir.join(format!("probe_{}.bin", block_size));
+    let img = dir.join(format!("{}_{}.img", tag, block_size));
     let _ = fs::remove_file(&img);
 
     // 16 MiB image is plenty for these fixtures.
@@ -88,6 +87,15 @@ fn make_image(block_size: u32, probe_len: usize) -> (PathBuf, Vec<u8>) {
         .status()
         .expect("mkfs.ext4 failed to spawn");
     assert!(status.success(), "mkfs.ext4 -b {block_size} failed");
+    img
+}
+
+/// Build a fresh image at `block_size`, with a single known file written via
+/// debugfs at `/probe.bin`. Returns the image path and the expected contents.
+fn make_image(block_size: u32, probe_len: usize) -> (PathBuf, Vec<u8>) {
+    let dir = Path::new("target").join("harness");
+    let img = fresh_image(block_size, "fixture");
+    let probe = dir.join(format!("probe_{}.bin", block_size));
 
     let data = payload(probe_len);
     fs::write(&probe, &data).unwrap();
@@ -157,6 +165,69 @@ fn read_probe_4k_baseline() {
 }
 
 #[test]
+fn read_probe_2k() {
+    read_probe_matches(2048);
+}
+
+#[test]
 fn read_probe_1k_target() {
     read_probe_matches(1024);
+}
+
+/// Create a file with the crate, write a multi-block payload, require e2fsck to
+/// be clean, then reopen and read it back. Exercises the write path: inode/block
+/// allocation, directory insertion + tail checksum, and write_at.
+fn write_probe_roundtrip(block_size: u32) {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") {
+        eprintln!("skipping: e2fsprogs tooling not available");
+        return;
+    }
+
+    let probe_len = 10_000;
+    let img = fresh_image(block_size, "written");
+    let expected = payload(probe_len);
+
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let ext4 = Ext4::open(dev);
+        let mode = InodeFileType::S_IFREG.bits() | 0o644;
+        let inode_ref = ext4
+            .create(ROOT_INODE, "written.bin", mode)
+            .expect("create /written.bin failed");
+        let n = ext4
+            .write_at(inode_ref.inode_num, 0, &expected)
+            .expect("write_at /written.bin failed");
+        assert_eq!(n, probe_len, "short write at block size {block_size}");
+    }
+
+    // The on-disk result must be a consistent filesystem.
+    fsck_clean(&img);
+
+    // Reopen and read it back through the crate.
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let ext4 = Ext4::open(dev);
+    let inode = ext4
+        .generic_open("/written.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("could not resolve /written.bin after write");
+    let mut buf = vec![0u8; probe_len];
+    let n = ext4
+        .read_at(inode, 0, &mut buf)
+        .expect("read_at /written.bin failed");
+    assert_eq!(n, probe_len, "short readback at block size {block_size}");
+    assert_eq!(buf, expected, "written content mismatch at block size {block_size}");
+}
+
+#[test]
+fn write_probe_4k_baseline() {
+    write_probe_roundtrip(4096);
+}
+
+#[test]
+fn write_probe_2k() {
+    write_probe_roundtrip(2048);
+}
+
+#[test]
+fn write_probe_1k_target() {
+    write_probe_roundtrip(1024);
 }

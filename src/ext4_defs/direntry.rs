@@ -177,9 +177,6 @@ impl Ext4DirEntry {
     }
 }
 
-/// The size of a block without its tail
-const BLOCK_DATA_SIZE: usize = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
-
 impl Ext4DirEntry {
     /// Get the checksum of the directory entry.
     #[allow(unused)]
@@ -193,12 +190,10 @@ impl Ext4DirEntry {
         csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid, uuid.len() as u32);
         csum = ext4_crc32c(csum, &ino_index.to_le_bytes(), 4);
         csum = ext4_crc32c(csum, &ino_gen.to_le_bytes(), 4);
-        let mut data = [0u8; BLOCK_DATA_SIZE];
-        unsafe {
-            core::ptr::copy_nonoverlapping(blk_data.as_ptr(), data.as_mut_ptr(), BLOCK_DATA_SIZE);
-        }
-
-        csum = ext4_crc32c(csum, &data[..], BLOCK_DATA_SIZE.try_into().unwrap());
+        // CRC the block up to (but not including) the tail. The tail size is
+        // fixed; the block size comes from the superblock.
+        let block_data_size = s.block_size() as usize - core::mem::size_of::<Ext4DirEntryTail>();
+        csum = ext4_crc32c(csum, &blk_data[..block_data_size], block_data_size as u32);
         csum
     }
 
@@ -247,7 +242,8 @@ impl Ext4DirEntryTail {
 
     pub fn copy_to_slice(&self, array: &mut [u8]) {
         unsafe {
-            let offset = BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>();
+            // `array` is the full directory block; the tail sits at its end.
+            let offset = array.len() - core::mem::size_of::<Ext4DirEntryTail>();
             let de_ptr = self as *const Ext4DirEntryTail as *const u8;
             let array_ptr = array as *mut [u8] as *mut u8;
             let count = core::mem::size_of::<Ext4DirEntryTail>();

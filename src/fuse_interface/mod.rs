@@ -22,7 +22,7 @@ impl Ext4 {
         let inode_num = search_result.dentry.inode;
 
         let inode_ref = self.get_inode_ref(inode_num);
-        let file_attr = FileAttr::from_inode_ref(&inode_ref);
+        let file_attr = FileAttr::from_inode_ref(&inode_ref, self.block_size() as u32);
 
         Ok(file_attr)
     }
@@ -30,7 +30,7 @@ impl Ext4 {
     /// Get file attributes.
     pub fn fuse_getattr(&self, ino: u64) -> Result<FileAttr> {
         let inode_ref = self.get_inode_ref(ino as u32);
-        let file_attr = FileAttr::from_inode_ref(&inode_ref);
+        let file_attr = FileAttr::from_inode_ref(&inode_ref, self.block_size() as u32);
         Ok(file_attr)
     }
 
@@ -478,7 +478,7 @@ impl Ext4 {
     /// int fstatat(int dirfd, const char *restrict pathname, struct stat *restrict statbuf, int flags);
     pub fn fuse_statfs(&mut self, ino: u64) -> Result<LinuxStat> {
         let inode_ref = self.get_inode_ref(ino as u32);
-        let linux_stat = LinuxStat::from_inode_ref(&inode_ref);
+        let linux_stat = LinuxStat::from_inode_ref(&inode_ref, self.block_size() as u32);
         Ok(linux_stat)
     }
 

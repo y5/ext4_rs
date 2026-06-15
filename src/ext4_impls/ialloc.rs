@@ -41,7 +41,7 @@ impl Ext4 {
 
                 // update bitmap in disk
                 self.block_device
-                    .write_offset(inode_bitmap_block as usize * BLOCK_SIZE, bitmap_data);
+                    .write_offset(inode_bitmap_block as usize * self.block_size(), bitmap_data);
 
                 bg.set_block_group_ialloc_bitmap_csum(&super_block, bitmap_data);
 
@@ -102,7 +102,7 @@ impl Ext4 {
         // Set new checksum after modification
         // update bitmap in disk
         self.block_device
-            .write_offset(inode_bitmap_block as usize * BLOCK_SIZE, &bitmap_data);
+            .write_offset(inode_bitmap_block as usize * self.block_size(), &bitmap_data);
         bg.set_block_group_ialloc_bitmap_csum(&super_block, &bitmap_data);
 
         // Update free inodes count in block group
