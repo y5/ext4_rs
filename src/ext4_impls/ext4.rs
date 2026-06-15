@@ -177,9 +177,26 @@ impl Ext4 {
     ) -> Result<usize> {
         self.dir_remove_entry(parent, name)?;
 
-        let is_dir = child.inode.is_dir();
+        // Drop the directory's link to the child and persist it. Without this
+        // the on-disk inode still shows links_count > 0, so a consistency
+        // checker sees a live but unreferenced inode even after the bitmap bit
+        // is cleared.
+        let links = child.inode.links_count().saturating_sub(1);
+        child.inode.set_links_count(links);
 
-        self.ialloc_free_inode(child.inode_num, is_dir);
+        if links == 0 {
+            // Last link gone: reset the slot to the all-zero unused state (what
+            // mkfs leaves) before releasing it. A deleted inode that keeps a
+            // non-zero i_mode with dtime == 0 reads as "deleted inode has zero
+            // dtime"; a small non-zero dtime instead reads as an orphan-list
+            // pointer. Zeroing sidesteps both (no wall clock in no_std).
+            let is_dir = child.inode.is_dir();
+            child.inode = Ext4Inode::default();
+            self.write_back_inode_without_csum(child);
+            self.ialloc_free_inode(child.inode_num, is_dir);
+        } else {
+            self.write_back_inode(child);
+        }
 
         Ok(EOK)
     }
