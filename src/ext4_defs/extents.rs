@@ -281,18 +281,12 @@ impl ExtentNode {
 impl ExtentNode {
     /// Binary search for the extent that contains the given block.
     pub fn binsearch_extent(&mut self, lblock: Ext4Lblk) -> Option<(Ext4Extent, usize)> {
-        // empty node
+        // Empty node: there is no extent to return. Fabricating one from the
+        // (possibly stale) slot bytes risks an `unwritten` flag making
+        // get_actual_len() huge, which would map a hole to a bogus block.
+        // Callers (find_extent) treat None as a hole and report pblock 0.
         if self.header.entries_count == 0 {
-            match &self.data {
-                NodeData::Root(root_data) => {
-                    let extent = Ext4Extent::load_from_u32(&root_data[3..]);
-                    return Some((extent, 0));
-                }
-                NodeData::Internal(internal_data) => {
-                    let extent = Ext4Extent::load_from_u8(&internal_data[12..]);
-                    return Some((extent, 0));
-                }
-            }
+            return None;
         }
 
         match &mut self.data {
@@ -651,9 +645,15 @@ mod tests {
         assert_eq!(extent.first_block, 10);
         assert_eq!(pos, 1);
 
-        // Search for a block outside the extents
+        // Search for a block beyond the last extent. binsearch_extent returns
+        // the nearest *preceding* extent (here the second one); detecting that
+        // the block lies in the gap past it is find_extent's job (it reports
+        // pblock 0 for the hole).
         let result = node.binsearch_extent(20);
-        assert!(result.is_none());
+        assert!(result.is_some());
+        let (extent, pos) = result.unwrap();
+        assert_eq!(extent.first_block, 10);
+        assert_eq!(pos, 1);
     }
 
     #[test]

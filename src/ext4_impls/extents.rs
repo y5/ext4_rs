@@ -160,7 +160,7 @@ impl Ext4 {
             // merge:       |<---found_ext--->|<---newex--->|
             //              10               20            40
             if pos < last_extent_pos
-                && ((ex.first_block + ex.block_count as u32) < newex.first_block)
+                && ((ex.first_block + ex.get_actual_len() as u32) < newex.first_block)
             {
                 if let Ok(next_extent) = self.get_extent_from_node(node, pos + 1) {
                     if self.can_merge(&next_extent, newex) {
@@ -177,7 +177,7 @@ impl Ext4 {
             //           0                  10          20                 30    40          50
             // merge:    |<---newex--->|<---found_ext--->|....|<---ext2--->|
             //           0            20                30    40          50
-            if pos > 0 && (newex.first_block + newex.block_count as u32) < ex.first_block {
+            if pos > 0 && (newex.first_block + newex.get_actual_len() as u32) < ex.first_block {
                 if let Ok(mut prev_extent) = self.get_extent_from_node(node, pos - 1) {
                     if self.can_merge(&prev_extent, newex) {
                         self.merge_extent(&search_path, &mut prev_extent, newex)?;
@@ -748,7 +748,9 @@ impl Ext4 {
             let ee_block = ex.first_block;
             let block_count = ex.block_count;
             let newblock = to + 1 - ee_block + ex.get_pblock() as u32;
-            ex.block_count = from as u16 - ee_block as u16;
+            // Subtract in u32 then narrow; casting each side to u16 first would
+            // truncate the high bits for logical blocks past 65535.
+            ex.block_count = from.saturating_sub(ee_block) as u16;
 
             if unwritten {
                 ex.mark_unwritten();
@@ -980,7 +982,9 @@ impl Ext4 {
 
             // Case 1: Remove a portion within the extent
             if start < from {
-                len -= from as u16 - start as u16;
+                // Subtract in u32 then narrow; per-operand u16 casts truncate
+                // the high bits for logical blocks past 65535.
+                len -= (from - start) as u16;
                 new_len = from - start;
                 start = from;
             } else {
@@ -1278,8 +1282,9 @@ impl Ext4 {
             let last_index_pos = header.entries_count as usize - 1;
             let node_disk_pos = path.pblock_of_node * BLOCK_SIZE;
             let ext4block = Block::load(&self.block_device, node_disk_pos);
-            let last_index: Ext4ExtentIndex =
-                ext4block.read_offset_as(size_of::<Ext4ExtentIndex>() * last_index_pos);
+            let last_index: Ext4ExtentIndex = ext4block.read_offset_as(
+                size_of::<Ext4ExtentHeader>() + size_of::<Ext4ExtentIndex>() * last_index_pos,
+            );
 
             if path.position > last_index_pos || index.first_block > last_index.first_block {
                 return false;
