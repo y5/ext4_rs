@@ -582,6 +582,52 @@ const FAST_TARGET: &str = "/etc/hostname";
 const SLOW_TARGET: &str =
     "/very/long/path/that/exceeds/sixty/bytes/and/must/live/in/a/data/block/xxxxxxx";
 
+/// Create a regular file, hardlink it under a second name, and require e2fsck
+/// to be clean: the on-disk link count must reflect both names. Both names must
+/// resolve to the same inode, and the data must be readable via the new name.
+fn hardlink_roundtrip(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "hardlink");
+    let data = payload(4000);
+
+    let orig_ino;
+    {
+        let mut ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "orig.bin", reg_mode()).expect("create");
+        orig_ino = f.inode_num;
+        ext4.write_at(f.inode_num, 0, &data).expect("write");
+        ext4.fuse_link(f.inode_num as u64, ROOT_INODE as u64, "link.bin")
+            .expect("link");
+    }
+    fsck_clean(&img); // link count must equal the number of names (2)
+
+    let ext4 = open_fs(&img);
+    let a = ext4
+        .generic_open("/orig.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("resolve /orig.bin");
+    let b = ext4
+        .generic_open("/link.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("resolve /link.bin");
+    assert_eq!(a, b, "hardlink resolves to a different inode @ {block_size}");
+    assert_eq!(a, orig_ino, "hardlink points at the wrong inode @ {block_size}");
+
+    let mut buf = vec![0u8; data.len()];
+    let n = ext4.read_at(b, 0, &mut buf).expect("read via /link.bin");
+    assert_eq!(n, data.len(), "hardlink short read @ {block_size}");
+    assert_eq!(buf, data, "hardlink content mismatch @ {block_size}");
+}
+
+#[test]
+fn hardlink_1k() {
+    hardlink_roundtrip(1024);
+}
+#[test]
+fn hardlink_4k() {
+    hardlink_roundtrip(4096);
+}
+
 #[test]
 fn symlink_fast_1k() {
     symlink_roundtrip(1024, "symlink_fast", FAST_TARGET);
