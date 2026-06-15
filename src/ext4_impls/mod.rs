@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod balloc;
 pub mod dir;
 pub mod ext4;
@@ -7,6 +8,7 @@ pub mod ialloc;
 pub mod inode;
 pub mod xattr;
 
+pub use acl::*;
 pub use balloc::*;
 pub use dir::*;
 pub use ext4::*;

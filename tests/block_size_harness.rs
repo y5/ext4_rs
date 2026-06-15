@@ -1435,3 +1435,82 @@ fn xattr_block_1k() {
 fn xattr_block_4k() {
     xattr_block(4096);
 }
+
+// --- POSIX ACLs ---
+
+/// Build a `system.posix_acl_access` value: version 2 header + 8-byte entries.
+fn acl_value(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&2u32.to_le_bytes());
+    for &(tag, perm, id) in entries {
+        v.extend_from_slice(&tag.to_le_bytes());
+        v.extend_from_slice(&perm.to_le_bytes());
+        v.extend_from_slice(&id.to_le_bytes());
+    }
+    v
+}
+
+/// Store an access ACL via the crate and check that the permission decision
+/// follows POSIX ACL rules (owner, named user, owning group, other, all bounded
+/// by the mask), with a clean fallback when no ACL is present.
+fn acl_enforce(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "acl");
+    const UNDEF: u32 = 0xFFFF_FFFF;
+    // owner rw, user:1001 r, group r, mask rw, other none.
+    let acl = acl_value(&[
+        (0x01, 0o6, UNDEF),
+        (0x02, 0o4, 1001),
+        (0x04, 0o4, UNDEF),
+        (0x10, 0o6, UNDEF),
+        (0x20, 0o0, UNDEF),
+    ]);
+
+    let ino;
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4
+            .create_with_attr(ROOT_INODE, "x.bin", InodeFileType::S_IFREG.bits() | 0o640, 1000, 2000)
+            .expect("create");
+        ino = f.inode_num;
+        ext4.xattr_set(ino, "system.posix_acl_access", &acl, 0).expect("set acl");
+        ext4.create(ROOT_INODE, "noacl.bin", reg_mode()).expect("create noacl");
+    }
+    fsck_clean(&img);
+
+    // R=4, W=2, X=1.
+    let ext4 = open_fs(&img);
+    let chk = |u, g, w| ext4.acl_access_check(ino, u, g, w);
+
+    assert_eq!(chk(1000, 0, 4), Some(true), "owner read @ {block_size}");
+    assert_eq!(chk(1000, 0, 2), Some(true), "owner write @ {block_size}");
+    assert_eq!(chk(1000, 0, 1), Some(false), "owner exec denied @ {block_size}");
+
+    assert_eq!(chk(1001, 7, 4), Some(true), "user:1001 read @ {block_size}");
+    assert_eq!(chk(1001, 7, 2), Some(false), "user:1001 write denied (mask) @ {block_size}");
+
+    assert_eq!(chk(9999, 2000, 4), Some(true), "group read @ {block_size}");
+    assert_eq!(chk(9999, 2000, 2), Some(false), "group write denied @ {block_size}");
+
+    assert_eq!(chk(5000, 5000, 4), Some(false), "other denied @ {block_size}");
+
+    // No ACL: fall back to mode bits.
+    let noacl = resolve(&ext4, "/noacl.bin").expect("resolve noacl");
+    assert_eq!(ext4.acl_access_check(noacl, 1, 1, 4), None, "no-acl falls back @ {block_size}");
+
+    // End-to-end through fuse_access (other has no read access).
+    let mut ext4 = open_fs(&img);
+    assert!(!ext4.fuse_access(ino as u64, 5000, 5000, 4, 0), "fuse_access other read @ {block_size}");
+    assert!(ext4.fuse_access(ino as u64, 1000, 0, 6, 0), "fuse_access owner rw @ {block_size}");
+}
+
+#[test]
+fn acl_enforce_1k() {
+    acl_enforce(1024);
+}
+#[test]
+fn acl_enforce_4k() {
+    acl_enforce(4096);
+}

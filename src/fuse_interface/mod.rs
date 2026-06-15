@@ -532,8 +532,13 @@ impl Ext4 {
     ///
     /// uid and gid come from request
     pub fn fuse_access(&mut self, ino: u64, uid: u16, gid: u16, mode: u16, mask: i32) -> bool {
-        let inode_ref = self.get_inode_ref(ino as u32);
+        // An access ACL, when present, overrides the plain mode-bit check.
+        let want = mode & 0o7;
+        if let Some(granted) = self.acl_access_check(ino as u32, uid, gid, want) {
+            return granted;
+        }
 
+        let inode_ref = self.get_inode_ref(ino as u32);
         inode_ref.inode.check_access(uid, gid, mode, mask as u16)
     }
 
