@@ -231,3 +231,161 @@ fn write_probe_2k() {
 fn write_probe_1k_target() {
     write_probe_roundtrip(1024);
 }
+
+// --- Hardening: exercise more write/metadata paths at non-4 KiB block sizes ---
+
+fn open_fs(img: &Path) -> Ext4 {
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(img));
+    Ext4::open(dev)
+}
+
+fn reg_mode() -> u16 {
+    InodeFileType::S_IFREG.bits() | 0o644
+}
+
+fn tooling_ready() -> bool {
+    !(tool_missing("mkfs.ext4") || tool_missing("e2fsck"))
+}
+
+/// Write a file in two calls (the second at EOF) and read the whole thing back.
+fn append_roundtrip(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "append");
+    let first = payload(5000);
+    let second: Vec<u8> = payload(5000).iter().map(|b| b ^ 0xff).collect();
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "a.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &first).expect("write 1");
+        ext4.write_at(f.inode_num, first.len(), &second)
+            .expect("append");
+    }
+    fsck_clean(&img);
+
+    let mut expected = first.clone();
+    expected.extend_from_slice(&second);
+    let ext4 = open_fs(&img);
+    let inode = ext4
+        .generic_open("/a.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("resolve");
+    let mut buf = vec![0u8; expected.len()];
+    let n = ext4.read_at(inode, 0, &mut buf).expect("read");
+    assert_eq!(n, expected.len(), "append short read @ {block_size}");
+    assert_eq!(buf, expected, "append mismatch @ {block_size}");
+}
+
+/// Make a subdirectory, create a file in it, write, and read it back by path.
+fn subdir_roundtrip(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "subdir");
+    let data = payload(8000);
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.dir_mk("/sub").expect("mkdir /sub");
+        let sub = ext4
+            .generic_open("/sub", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("resolve /sub");
+        let f = ext4.create(sub, "f.bin", reg_mode()).expect("create in subdir");
+        ext4.write_at(f.inode_num, 0, &data).expect("write");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let inode = ext4
+        .generic_open("/sub/f.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("resolve /sub/f.bin");
+    let mut buf = vec![0u8; data.len()];
+    let n = ext4.read_at(inode, 0, &mut buf).expect("read");
+    assert_eq!(n, data.len(), "subdir short read @ {block_size}");
+    assert_eq!(buf, data, "subdir mismatch @ {block_size}");
+}
+
+/// Write a file, shrink it with truncate, verify the new size and contents.
+fn truncate_roundtrip(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "truncate");
+    let full = payload(10_000);
+    let new_len = 3000usize;
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "t.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &full).expect("write");
+        let mut inode_ref = ext4.get_inode_ref(f.inode_num);
+        ext4.truncate_inode(&mut inode_ref, new_len as u64)
+            .expect("truncate");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let inode = ext4
+        .generic_open("/t.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("resolve");
+    let mut buf = vec![0u8; full.len()];
+    let n = ext4.read_at(inode, 0, &mut buf).expect("read");
+    assert_eq!(n, new_len, "truncate size wrong @ {block_size}");
+    assert_eq!(&buf[..new_len], &full[..new_len], "truncate content @ {block_size}");
+}
+
+/// Create a file, remove it, and confirm the filesystem stays consistent and
+/// the path no longer resolves.
+fn delete_clean(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "delete");
+    let data = payload(6000);
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "d.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &data).expect("write");
+        ext4.file_remove("/d.bin").expect("remove");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let r = ext4.generic_open("/d.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+    assert!(r.is_err(), "removed file still resolves @ {block_size}");
+}
+
+#[test]
+fn append_1k() {
+    append_roundtrip(1024);
+}
+#[test]
+fn append_4k() {
+    append_roundtrip(4096);
+}
+#[test]
+fn subdir_1k() {
+    subdir_roundtrip(1024);
+}
+#[test]
+fn subdir_4k() {
+    subdir_roundtrip(4096);
+}
+#[test]
+fn truncate_1k() {
+    truncate_roundtrip(1024);
+}
+#[test]
+fn truncate_4k() {
+    truncate_roundtrip(4096);
+}
+#[test]
+fn delete_1k() {
+    delete_clean(1024);
+}
+#[test]
+fn delete_4k() {
+    delete_clean(4096);
+}
