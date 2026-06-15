@@ -9,12 +9,10 @@ impl Ext4 {
         let bg_count = self.super_block.block_group_count();
         let mut super_block = self.super_block;
 
-        while bgid <= bg_count {
-            if bgid == bg_count {
-                bgid = 0;
-                continue;
-            }
-
+        // Single pass over all groups. Nothing changes between passes, so the
+        // old wrap-around (reset bgid to 0 and continue) just spun forever once
+        // every group was full; fall through to ENOSPC instead.
+        while bgid < bg_count {
             let mut bg = Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
 
             let mut free_inodes = bg.get_free_inodes_count();
@@ -32,7 +30,13 @@ impl Ext4 {
 
                 let mut idx_in_bg = 0;
 
-                ext4_bmap_bit_find_clr(bitmap_data, 0, inodes_in_bg, &mut idx_in_bg);
+                // If the free-inode count disagrees with the bitmap (no clear
+                // bit actually found), skip this group instead of falling
+                // through and re-allocating bit 0.
+                if !ext4_bmap_bit_find_clr(bitmap_data, 0, inodes_in_bg, &mut idx_in_bg) {
+                    bgid += 1;
+                    continue;
+                }
                 ext4_bmap_bit_set(bitmap_data, idx_in_bg);
 
                 // update bitmap in disk
@@ -53,9 +57,9 @@ impl Ext4 {
 
                 /* Decrease unused inodes count */
                 let mut unused = bg.get_itable_unused(&super_block);
-                let free = inodes_in_bg - unused;
+                let free = inodes_in_bg.saturating_sub(unused);
                 if idx_in_bg >= free {
-                    unused = inodes_in_bg - (idx_in_bg + 1);
+                    unused = inodes_in_bg.saturating_sub(idx_in_bg + 1);
                     bg.set_itable_unused(&super_block, unused);
                 }
 
@@ -107,13 +111,14 @@ impl Ext4 {
 
         // If inode was a directory, decrement the used directories count
         if is_dir {
-            let used_dirs = bg.get_used_dirs_count(&self.super_block) - 1;
+            let used_dirs = bg.get_used_dirs_count(&self.super_block).saturating_sub(1);
             bg.set_used_dirs_count(&self.super_block, used_dirs);
         }
 
         bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
-        super_block.decrease_free_inodes_count();
+        // Freeing an inode increases the count of free inodes.
+        super_block.increase_free_inodes_count();
         super_block.sync_to_disk_with_csum(&self.block_device);
     }
 }
