@@ -262,7 +262,7 @@ impl Ext4 {
 
             // Check if this is the last block of the file
             if iblock as u64 >= total_blocks - 1 {
-                let remaining_bytes = file_size as usize - (iblock * block_size);
+                let remaining_bytes = (file_size as usize).saturating_sub(iblock * block_size);
                 let actual_read_length = min(read_length, remaining_bytes);
 
                 if actual_read_length < read_length {

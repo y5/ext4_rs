@@ -113,7 +113,7 @@ impl Ext4 {
         let mut data: &mut Vec<u8> = &mut block_bmap_raw_data;
         let mut rel_blk_idx = 0;
 
-        ext4_bmap_bit_find_clr(data, index, 0x8000, &mut rel_blk_idx);
+        ext4_bmap_bit_find_clr(data, index, super_block.blocks_per_group(), &mut rel_blk_idx);
         ext4_bmap_bit_set(data, rel_blk_idx);
 
         block_group.set_block_group_balloc_bitmap_csum(&super_block, data);
