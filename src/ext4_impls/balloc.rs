@@ -447,12 +447,13 @@ impl Ext4 {
 
         let blocks_per_group = super_block.blocks_per_group();
 
-        let bgid = start / blocks_per_group as u64;
-
         let mut bg_first = start / blocks_per_group as u64;
         let mut bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
 
         while bg_first <= bg_last {
+            // Recompute the group from the current `start`; a free range may span
+            // multiple groups, and `start` advances by `free_cnt` each iteration.
+            let bgid = start / blocks_per_group as u64;
             let idx_in_bg = start % blocks_per_group as u64;
 
             let mut bg = Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
