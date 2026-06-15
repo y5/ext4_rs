@@ -430,19 +430,28 @@ impl Ext4Inode {
     }
     #[allow(unused)]
     pub fn get_inode_checksum(&mut self, inode_id: u32, super_block: &Ext4Superblock) -> u32 {
-        let inode_size = super_block.inode_size();
+        self.get_inode_checksum_with_tail(inode_id, super_block, &[])
+    }
 
-        let orig_checksum = self.get_checksum(super_block);
-        let mut checksum = 0;
+    /// Inode checksum, folding in `tail` — the on-disk bytes past the in-memory
+    /// struct (in-inode xattrs etc.). Pass `&[]` when the inode has no such tail;
+    /// the result is then identical to checksumming the struct zero-padded.
+    pub fn get_inode_checksum_with_tail(
+        &mut self,
+        inode_id: u32,
+        super_block: &Ext4Superblock,
+        tail: &[u8],
+    ) -> u32 {
+        let inode_size = super_block.inode_size();
 
         let ino_index = inode_id;
         let ino_gen = self.generation;
 
-        // Preparation: temporarily set bg checksum to 0
+        // Preparation: temporarily set inode checksum to 0
         self.osd2.l_i_checksum_lo = 0;
         self.i_checksum_hi = 0;
 
-        checksum = ext4_crc32c(
+        let mut checksum = ext4_crc32c(
             EXT4_CRC32_INIT,
             &super_block.uuid,
             super_block.uuid.len() as u32,
@@ -452,6 +461,11 @@ impl Ext4Inode {
 
         let mut raw_data = [0u8; 0x100];
         self.copy_to_slice(&mut raw_data);
+        // Overlay the real on-disk tail (the struct write leaves these bytes
+        // untouched, so the checksum must reflect their actual contents).
+        const STRUCT_LEN: usize = 0x9c;
+        let n = core::cmp::min(tail.len(), raw_data.len() - STRUCT_LEN);
+        raw_data[STRUCT_LEN..STRUCT_LEN + n].copy_from_slice(&tail[..n]);
 
         // inode checksum
         checksum = ext4_crc32c(checksum, &raw_data, inode_size as u32);
@@ -466,8 +480,17 @@ impl Ext4Inode {
     }
 
     pub fn set_inode_checksum(&mut self, super_block: &Ext4Superblock, inode_id: u32) {
+        self.set_inode_checksum_with_tail(super_block, inode_id, &[]);
+    }
+
+    pub fn set_inode_checksum_with_tail(
+        &mut self,
+        super_block: &Ext4Superblock,
+        inode_id: u32,
+        tail: &[u8],
+    ) {
         let inode_size = super_block.inode_size();
-        let checksum = self.get_inode_checksum(inode_id, super_block);
+        let checksum = self.get_inode_checksum_with_tail(inode_id, super_block, tail);
 
         self.osd2.l_i_checksum_lo = ((checksum << 16) >> 16) as u16;
         if inode_size > 128 {

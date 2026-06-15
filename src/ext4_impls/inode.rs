@@ -53,10 +53,22 @@ impl Ext4 {
     pub fn write_back_inode(&self, inode_ref: &mut Ext4InodeRef) {
         let inode_pos = self.inode_disk_pos(inode_ref.inode_num);
 
-        // make sure self.super_block is up-to-date
+        // The struct write below only covers the first 156 bytes; the rest of
+        // the on-disk record (in-inode xattrs etc.) is preserved untouched, so
+        // fold its real bytes into the checksum. For an inode without a tail
+        // those bytes are zero and the result matches the struct-only checksum.
+        let struct_len = size_of::<Ext4Inode>();
+        let inode_size = self.super_block.inode_size() as usize;
+        let tail = if inode_size > struct_len {
+            self.block_device
+                .read_offset(inode_pos + struct_len, inode_size - struct_len)
+        } else {
+            Vec::new()
+        };
+
         inode_ref
             .inode
-            .set_inode_checksum(&self.super_block, inode_ref.inode_num);
+            .set_inode_checksum_with_tail(&self.super_block, inode_ref.inode_num, &tail);
         inode_ref
             .inode
             .sync_inode_to_disk(&self.block_device, inode_pos);

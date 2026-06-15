@@ -23,9 +23,65 @@ const XATTR_PAD: usize = 4;
 /// Size of the external-block header.
 const BLOCK_HDR: usize = 32;
 
+/// setxattr flags.
+const XATTR_CREATE: i32 = 1; // fail if the attribute already exists
+const XATTR_REPLACE: i32 = 2; // fail if the attribute does not exist
+
 /// On-disk size of an entry record: fixed part + name, padded.
 fn entry_len(name_len: usize) -> usize {
     (ENTRY_FIXED + name_len + XATTR_PAD - 1) & !(XATTR_PAD - 1)
+}
+
+/// Value storage is padded to `XATTR_PAD`.
+fn value_pad(size: usize) -> usize {
+    (size + XATTR_PAD - 1) & !(XATTR_PAD - 1)
+}
+
+/// Serialize `attrs` into an entry-array-plus-values region of `region_len`
+/// bytes (entries grow up from the start, values grow down from the end,
+/// `e_value_offs` measured from the region start). `e_hash` is left 0, which is
+/// correct for the inode body. Returns None if the attributes don't fit.
+fn serialize_region(attrs: &[ParsedXattr], region_len: usize) -> Option<Vec<u8>> {
+    let mut region = vec![0u8; region_len];
+
+    // ext4 keeps entries sorted by (name_index, name).
+    let mut sorted: Vec<&ParsedXattr> = attrs.iter().collect();
+    sorted.sort_by(|a, b| (a.name_index, &a.name).cmp(&(b.name_index, &b.name)));
+
+    let mut entry_off = 0usize; // entries grow up
+    let mut value_end = region_len; // values grow down
+
+    for a in sorted {
+        let elen = entry_len(a.name.len());
+        let vpad = value_pad(a.value.len());
+        // Need room for this entry, the 4-byte terminator, and the value.
+        if entry_off + elen + 4 > value_end.saturating_sub(vpad) {
+            return None;
+        }
+
+        let e_value_offs = if a.value.is_empty() {
+            0u16
+        } else {
+            let voff = value_end - vpad;
+            region[voff..voff + a.value.len()].copy_from_slice(&a.value);
+            value_end = voff;
+            voff as u16
+        };
+
+        region[entry_off] = a.name.len() as u8;
+        region[entry_off + 1] = a.name_index;
+        region[entry_off + 2..entry_off + 4].copy_from_slice(&e_value_offs.to_le_bytes());
+        // e_value_inum (4) stays 0
+        region[entry_off + 8..entry_off + 12]
+            .copy_from_slice(&(a.value.len() as u32).to_le_bytes());
+        // e_hash (4) stays 0
+        region[entry_off + ENTRY_FIXED..entry_off + ENTRY_FIXED + a.name.len()]
+            .copy_from_slice(&a.name);
+
+        entry_off += elen;
+    }
+    // The terminating zero entry is already present (region is zero-filled).
+    Some(region)
 }
 
 /// Map a name prefix to its on-disk `e_name_index` and the remaining suffix.
@@ -183,5 +239,124 @@ impl Ext4 {
             }
         }
         Ok(names)
+    }
+
+    /// Byte offset of the ibody xattr area within the inode record, and the
+    /// record size — or None when the inode is too small to hold any.
+    fn ibody_geometry(&self, inode: &Ext4Inode) -> Option<(usize, usize)> {
+        let inode_size = self.super_block.inode_size() as usize;
+        let extra = inode.i_extra_isize() as usize;
+        let off = EXT4_GOOD_OLD_INODE_SIZE as usize + extra;
+        if extra > 0 && off + 4 < inode_size {
+            Some((off, inode_size))
+        } else {
+            None
+        }
+    }
+
+    /// Parse only the in-inode attributes.
+    fn read_ibody_attrs(&self, ino: u32, inode: &Ext4Inode) -> Vec<ParsedXattr> {
+        let (off, inode_size) = match self.ibody_geometry(inode) {
+            Some(g) => g,
+            None => return Vec::new(),
+        };
+        let record = self
+            .block_device
+            .read_offset(self.inode_disk_pos(ino), inode_size);
+        let magic = u32::from_le_bytes([
+            record[off],
+            record[off + 1],
+            record[off + 2],
+            record[off + 3],
+        ]);
+        if magic != EXT4_XATTR_MAGIC {
+            return Vec::new();
+        }
+        let region = &record[off + 4..inode_size];
+        parse_entries(region, region)
+    }
+
+    /// Write `attrs` into the inode body, refreshing the inode checksum. Returns
+    /// ENOSPC if they don't fit (block spillover is handled by the caller).
+    fn write_ibody_attrs(&self, ino: u32, attrs: &[ParsedXattr]) -> Result<()> {
+        let mut inode_ref = self.get_inode_ref(ino);
+        let (off, inode_size) = match self.ibody_geometry(&inode_ref.inode) {
+            Some(g) => g,
+            None => return_errno_with_message!(Errno::ENOSPC, "inode has no xattr space"),
+        };
+        let inode_pos = self.inode_disk_pos(ino);
+
+        if attrs.is_empty() {
+            // No attributes left: clear the header so the area reads as empty.
+            let zeros = vec![0u8; inode_size - off];
+            self.block_device.write_offset(inode_pos + off, &zeros);
+            self.write_back_inode(&mut inode_ref);
+            return Ok(());
+        }
+
+        let region_len = inode_size - off - 4;
+        let region = match serialize_region(attrs, region_len) {
+            Some(r) => r,
+            None => return_errno_with_message!(Errno::ENOSPC, "xattrs do not fit in inode body"),
+        };
+
+        // Magic followed by the entry/value region.
+        let mut bytes = Vec::with_capacity(4 + region.len());
+        bytes.extend_from_slice(&EXT4_XATTR_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&region);
+        self.block_device.write_offset(inode_pos + off, &bytes);
+
+        // Recompute the inode checksum over the new record tail.
+        self.write_back_inode(&mut inode_ref);
+        Ok(())
+    }
+
+    /// Set (create or replace) an extended attribute. `flags` may be
+    /// XATTR_CREATE (fail if present) or XATTR_REPLACE (fail if absent).
+    pub fn xattr_set(&self, ino: u32, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        let (idx, suffix) = match split_name(name) {
+            Some(v) => v,
+            None => return_errno_with_message!(Errno::ENOTSUP, "unsupported xattr namespace"),
+        };
+
+        let inode = self.get_inode_ref(ino).inode;
+        let mut attrs = self.read_ibody_attrs(ino, &inode);
+        let exists = attrs
+            .iter()
+            .any(|a| a.name_index == idx && a.name == suffix.as_bytes());
+
+        if flags & XATTR_CREATE != 0 && exists {
+            return_errno_with_message!(Errno::EEXIST, "xattr exists");
+        }
+        if flags & XATTR_REPLACE != 0 && !exists {
+            return_errno_with_message!(Errno::ENODATA, "xattr does not exist");
+        }
+
+        attrs.retain(|a| !(a.name_index == idx && a.name == suffix.as_bytes()));
+        attrs.push(ParsedXattr {
+            name_index: idx,
+            name: suffix.as_bytes().to_vec(),
+            value: value.to_vec(),
+        });
+
+        self.write_ibody_attrs(ino, &attrs)
+    }
+
+    /// Remove an extended attribute, or ENODATA if it is not present.
+    pub fn xattr_remove(&self, ino: u32, name: &str) -> Result<()> {
+        let (idx, suffix) = match split_name(name) {
+            Some(v) => v,
+            None => return_errno_with_message!(Errno::ENODATA, "unsupported xattr namespace"),
+        };
+
+        let inode = self.get_inode_ref(ino).inode;
+        let mut attrs = self.read_ibody_attrs(ino, &inode);
+        let before = attrs.len();
+        attrs.retain(|a| !(a.name_index == idx && a.name == suffix.as_bytes()));
+        if attrs.len() == before {
+            return_errno_with_message!(Errno::ENODATA, "no such xattr");
+        }
+
+        self.write_ibody_attrs(ino, &attrs)
     }
 }

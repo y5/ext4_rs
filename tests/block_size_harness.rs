@@ -1290,3 +1290,78 @@ fn xattr_read_1k() {
 fn xattr_read_4k() {
     xattr_read(4096);
 }
+
+/// The crate writes attributes into the inode body; e2fsck must stay clean,
+/// debugfs must read them back, and the crate must round-trip them. Also checks
+/// removal and the XATTR_CREATE/REPLACE flag semantics.
+fn xattr_write_ibody(block_size: u32) {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image(block_size, "xattr_wib");
+
+    let ino;
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "x.bin", reg_mode()).expect("create");
+        ino = f.inode_num;
+        ext4.xattr_set(ino, "user.a", b"alpha", 0).expect("set a");
+        ext4.xattr_set(ino, "user.b", b"beta", 0).expect("set b");
+        ext4.xattr_set(ino, "security.s", b"sek", 0).expect("set s");
+    }
+    fsck_clean(&img);
+
+    // External oracle: debugfs sees the attributes the crate wrote.
+    let listed = debugfs(&img, "ea_list /x.bin");
+    for n in ["user.a", "user.b", "security.s"] {
+        assert!(listed.contains(n), "debugfs missing {n} @ {block_size}:\n{listed}");
+    }
+    assert!(
+        debugfs(&img, "ea_get /x.bin user.a").contains("alpha"),
+        "debugfs ea_get user.a @ {block_size}"
+    );
+
+    {
+        let ext4 = open_fs(&img);
+        assert_eq!(ext4.xattr_get(ino, "user.a").unwrap(), b"alpha");
+        assert_eq!(ext4.xattr_get(ino, "user.b").unwrap(), b"beta");
+        assert_eq!(ext4.xattr_get(ino, "security.s").unwrap(), b"sek");
+
+        // Flag semantics.
+        assert_eq!(
+            ext4.xattr_set(ino, "user.a", b"x", 1).unwrap_err().error(),
+            Errno::EEXIST,
+            "CREATE on existing @ {block_size}"
+        );
+        assert_eq!(
+            ext4.xattr_set(ino, "user.none", b"x", 2).unwrap_err().error(),
+            Errno::ENODATA,
+            "REPLACE on missing @ {block_size}"
+        );
+
+        // Remove one.
+        ext4.xattr_remove(ino, "user.b").expect("remove b");
+        assert_eq!(
+            ext4.xattr_remove(ino, "user.b").unwrap_err().error(),
+            Errno::ENODATA,
+            "remove missing @ {block_size}"
+        );
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert_eq!(ext4.xattr_get(ino, "user.b").unwrap_err().error(), Errno::ENODATA);
+    assert_eq!(ext4.xattr_get(ino, "user.a").unwrap(), b"alpha", "a survived removal");
+    let mut names = ext4.xattr_list(ino).unwrap();
+    names.sort();
+    assert_eq!(names, vec!["security.s", "user.a"], "final list @ {block_size}");
+}
+
+#[test]
+fn xattr_write_ibody_1k() {
+    xattr_write_ibody(1024);
+}
+#[test]
+fn xattr_write_ibody_4k() {
+    xattr_write_ibody(4096);
+}
