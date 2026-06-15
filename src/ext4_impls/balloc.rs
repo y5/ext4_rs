@@ -90,7 +90,10 @@ impl Ext4 {
             bgid = self.get_bgid_of_block(goal);
             idx_in_bg = self.addr_to_idx_bg(goal);
         } else {
-            bgid = 1;
+            // Default to group 0. Starting at group 1 lands out of range on a
+            // single-block-group filesystem (e.g. a small 4 KiB-block image),
+            // where the scan then fails with a spurious ENOSPC.
+            bgid = 0;
             idx_in_bg = 0;
         }
 
