@@ -1092,17 +1092,26 @@ fn rename_into_own_subtree_4k() {
 /// multi-level (index -> leaf) shape, splitting nodes as leaves fill. e2fsck
 /// must stay clean and every block must read back.
 fn fragmented_file(block_size: u32, n: usize, min_depth: u16) {
+    fragmented_ordered(block_size, min_depth, &format!("frag{}", n), (0..n).collect());
+}
+
+/// Like `fragmented_file`, but writes the `n` regions in the given `order`,
+/// then verifies every block reads back regardless of insertion order. The
+/// final logical layout is identical; only the order of `write_at` calls
+/// differs, which exercises mid/front insertion into existing nodes.
+fn fragmented_ordered(block_size: u32, min_depth: u16, tag: &str, order: Vec<usize>) {
     if !tooling_ready() {
         return;
     }
+    let n = order.len();
     let bs = block_size as usize;
-    let img = fresh_image(block_size, &format!("frag{}", n));
+    let img = fresh_image(block_size, tag);
     let mk = |i: usize| -> Vec<u8> { payload(bs).iter().map(|b| b ^ (i as u8)).collect() };
 
     {
         let ext4 = open_fs(&img);
         let f = ext4.create(ROOT_INODE, "frag.bin", reg_mode()).expect("create");
-        for i in 0..n {
+        for &i in &order {
             // logical blocks 0, 2, 4, ... — a hole between each keeps the
             // extents from merging.
             ext4.write_at(f.inode_num, i * 2 * bs, &mk(i)).expect("write");
@@ -1116,12 +1125,12 @@ fn fragmented_file(block_size: u32, n: usize, min_depth: u16) {
     // The tree must actually have grown to the expected shape, else the test
     // isn't exercising the multi-level paths it claims to.
     let depth = ext4.get_inode_ref(ino).inode.root_extent_header().depth;
-    assert!(depth >= min_depth, "extent tree depth {depth} < {min_depth} @ {block_size}");
+    assert!(depth >= min_depth, "extent tree depth {depth} < {min_depth} ({tag})");
 
     for i in 0..n {
         let mut buf = vec![0u8; bs];
         ext4.read_at(ino, i * 2 * bs, &mut buf).expect("read");
-        assert_eq!(buf, mk(i), "extent {i} mismatch @ {block_size}");
+        assert_eq!(buf, mk(i), "extent {i} mismatch ({tag})");
     }
 }
 
@@ -1151,6 +1160,55 @@ fn fragmented_huge_1k() {
     // itself split, not just the leaves.
     fragmented_file(1024, 8000, 2);
 }
+#[test]
+fn fragmented_descending_1k() {
+    // Highest logical block written first: every later write inserts before
+    // existing extents (front of nodes), repointing parent index keys.
+    fragmented_ordered(1024, 2, "frag_desc", (0..600).rev().collect());
+}
+#[test]
+fn fragmented_shuffled_1k() {
+    // Deterministic permutation (coprime stride) so writes land in arbitrary
+    // positions within nodes, not just the front or back.
+    let n = 600usize;
+    let order: Vec<usize> = (0..n).map(|k| (k * 137) % n).collect();
+    fragmented_ordered(1024, 2, "frag_shuf", order);
+}
+
+/// Overwrite an existing region in place: the second write must reuse the
+/// already-allocated blocks (no new allocation, no leaks) and leave the new
+/// contents. Guards the write path's allocate-only-holes decision.
+fn overwrite_in_place(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "overwrite");
+    let a = payload(8000);
+    let b: Vec<u8> = payload(8000).iter().map(|x| x ^ 0xa5).collect();
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "o.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &a).expect("write a");
+        ext4.write_at(f.inode_num, 0, &b).expect("overwrite b");
+    }
+    fsck_clean(&img); // reused blocks, no leaked/duplicate blocks
+
+    let ext4 = open_fs(&img);
+    let ino = resolve(&ext4, "/o.bin").expect("resolve");
+    let mut buf = vec![0u8; b.len()];
+    ext4.read_at(ino, 0, &mut buf).expect("read");
+    assert_eq!(buf, b, "overwrite content wrong @ {block_size}");
+}
+
+#[test]
+fn overwrite_in_place_1k() {
+    overwrite_in_place(1024);
+}
+#[test]
+fn overwrite_in_place_4k() {
+    overwrite_in_place(4096);
+}
 
 #[test]
 fn symlink_fast_1k() {
@@ -1168,3 +1226,4 @@ fn symlink_slow_1k() {
 fn symlink_slow_4k() {
     symlink_roundtrip(4096, "symlink_slow", SLOW_TARGET);
 }
+

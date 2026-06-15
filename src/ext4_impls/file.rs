@@ -340,11 +340,9 @@ impl Ext4 {
         let block_size = self.block_size();
         let iblock_start = offset / block_size;
         let iblock_last = (offset + write_buf_len + block_size - 1) / block_size;
-        let total_blocks_needed = iblock_last - iblock_start;
 
         // start block index
         let mut iblk_idx = iblock_start;
-        let ifile_blocks = (file_size + block_size as u64 - 1) / block_size as u64;
 
         // Calculate the unaligned size
         let unaligned = offset % block_size;
@@ -360,96 +358,52 @@ impl Ext4 {
         // Start bgid for block allocation
         let mut start_bgid = 0;
 
-        // Pre-allocate blocks if needed. Only the portion of the write at or
-        // beyond EOF needs new blocks; an in-place overwrite needs none. Use
-        // saturating_sub — a plain `usize` subtraction here underflows when the
-        // write lies fully within existing blocks, producing an astronomically
-        // large count that drives a capacity-overflow panic on allocation.
-        let blocks_to_allocate = if iblk_idx >= ifile_blocks as usize {
-            total_blocks_needed
-        } else {
-            total_blocks_needed.saturating_sub(ifile_blocks as usize - iblk_idx)
+        // Ensure every logical block the write touches is mapped to a physical
+        // block, allocating any holes. A hole can lie *below* EOF in a sparse
+        // file (e.g. a higher logical block was written first), so allocation
+        // can't be decided from the file size alone. Blocks at or beyond the
+        // original EOF are always unmapped, so only the below-EOF portion needs
+        // a per-block check; maximal runs of holes are filled in one batch.
+        let ifile_blocks = ((file_size + block_size as u64 - 1) / block_size as u64) as usize;
+        let is_hole = |fs: &Self, ir: &Ext4InodeRef, b: usize| -> bool {
+            b >= ifile_blocks || fs.get_pblock_idx(ir, b as u32).unwrap_or(0) == 0
         };
 
-        if blocks_to_allocate > 0 {
-            log::trace!("[Pre-allocation] Allocating {} blocks", blocks_to_allocate);
-
-            // Map the new blocks at the first logical block of the write that
-            // lies at or beyond EOF. For an append this is the next block; for a
-            // sparse write past a gap it is the write's start block, leaving the
-            // gap as a hole. Mapping contiguously after the last extent instead
-            // (the old `append_inode_pblk_batch` behaviour) lands the data at the
-            // wrong logical block — the target stays a hole and the write hits
-            // physical block 0, corrupting the superblock.
-            let target_lblock = max(iblock_start, ifile_blocks as usize) as u32;
-            let allocated_blocks = self.map_inode_pblk_batch(
-                &mut inode_ref,
-                &mut start_bgid,
-                target_lblock,
-                blocks_to_allocate,
-            )?;
-
-            // If we couldn't allocate all blocks, adjust the write size
-            if allocated_blocks.len() < blocks_to_allocate {
-                log::trace!(
-                    "[Write] Could only allocate {} out of {} blocks",
-                    allocated_blocks.len(),
-                    blocks_to_allocate
-                );
-
-                // Calculate new write size based on allocated blocks
-                let max_write_size = allocated_blocks.len() * block_size;
-                let adjusted_write_size = if unaligned > 0 {
-                    // For unaligned writes, we need to account for the unaligned portion
-                    if allocated_blocks.len() > 0 {
-                        let first_block_available = block_size - unaligned;
-                        let remaining_blocks_available = (allocated_blocks.len() - 1) * block_size;
-                        first_block_available + remaining_blocks_available
-                    } else {
-                        0
-                    }
-                } else {
-                    max_write_size
-                };
-
-                if adjusted_write_size == 0 {
-                    log::error!("[Write] No space available for write after block allocation");
-                    return return_errno_with_message!(
-                        Errno::ENOSPC,
-                        "No blocks available for write"
-                    );
+        let mut first_unmapped: Option<usize> = None;
+        {
+            let mut lb = iblock_start;
+            while lb < iblock_last {
+                if !is_hole(self, &inode_ref, lb) {
+                    lb += 1;
+                    continue;
                 }
-
-                // Update write size
-                write_buf_len = min(write_buf_len, adjusted_write_size);
-                log::trace!(
-                    "[Write] Adjusted write size from {} to {} bytes",
-                    write_buf.len(),
-                    write_buf_len
-                );
+                let mut run_end = lb + 1;
+                while run_end < iblock_last && is_hole(self, &inode_ref, run_end) {
+                    run_end += 1;
+                }
+                let count = run_end - lb;
+                let allocated =
+                    self.map_inode_pblk_batch(&mut inode_ref, &mut start_bgid, lb as u32, count)?;
+                new_blocks += allocated.len();
+                if allocated.len() < count {
+                    // Out of space partway through this run of holes.
+                    first_unmapped = Some(lb + allocated.len());
+                    break;
+                }
+                lb = run_end;
             }
-
-            new_blocks += allocated_blocks.len();
         }
 
-        // Verify we have enough blocks for the write
-        let required_blocks = (write_buf_len + block_size - 1) / block_size;
-        let available_blocks = if iblk_idx >= ifile_blocks as usize {
-            new_blocks
-        } else {
-            (ifile_blocks as usize - iblk_idx) + new_blocks
-        };
-
-        if available_blocks < required_blocks {
-            log::error!(
-                "[Write] Not enough blocks available: required {}, available {}",
-                required_blocks,
-                available_blocks
-            );
-            return return_errno_with_message!(
-                Errno::ENOSPC,
-                "Not enough blocks available for write"
-            );
+        // If allocation couldn't cover the whole range, truncate the write to
+        // the bytes now backed by real blocks.
+        if let Some(f) = first_unmapped {
+            if f <= iblock_start {
+                return return_errno_with_message!(
+                    Errno::ENOSPC,
+                    "No blocks available for write"
+                );
+            }
+            write_buf_len = min(write_buf_len, f * block_size - offset);
         }
 
         // Unaligned write

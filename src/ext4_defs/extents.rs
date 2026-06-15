@@ -391,11 +391,13 @@ impl ExtentNode {
                     }
                 }
 
-                if l == 0 {
-                    return None;
-                }
-
-                Some(l - 1)
+                // When `lblock` precedes every index key (l == 0), route to the
+                // leftmost child rather than failing: that child holds the start
+                // of the range and is where a new minimum belongs. (The root
+                // branch above already routes such blocks to index 0; internal
+                // nodes must match, or descending into a deep tree to insert a
+                // new global-minimum block fails with ENOENT.)
+                Some(l.saturating_sub(1))
             }
         }
     }
