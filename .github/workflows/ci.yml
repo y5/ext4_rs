@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The block-size fixture harness shells out to mkfs.ext4, debugfs and
+      # e2fsck. Without these the harness tests silently skip, so install them.
+      - name: Install e2fsprogs
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      # The toolchain (nightly-2024-06-01) is pinned by rust-toolchain.toml;
+      # rustup installs it on first use.
+      - name: Show toolchain
+        run: rustup show
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Test
+        run: cargo test --verbose
