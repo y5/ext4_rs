@@ -465,12 +465,12 @@ impl Ext4 {
                 .read_offset(block_bitmap_block as usize * BLOCK_SIZE);
             let mut data: &mut Vec<u8> = &mut raw_data;
 
-            let mut free_cnt = BLOCK_SIZE * 8 - idx_in_bg as usize;
-
-            if count > free_cnt {
-            } else {
-                free_cnt = count;
-            }
+            // Number of blocks left in this group from idx_in_bg. The bitmap
+            // block holds BLOCK_SIZE*8 bits, but only blocks_per_group of them
+            // are valid; using the bit capacity would over-free into the next
+            // group's range and desync `start` when blocks_per_group is smaller.
+            let remaining_in_group = super_block.blocks_per_group() as usize - idx_in_bg as usize;
+            let free_cnt = count.min(remaining_in_group);
 
             ext4_bmap_bits_free(
                 data,
