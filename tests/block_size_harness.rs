@@ -1514,3 +1514,68 @@ fn acl_enforce_1k() {
 fn acl_enforce_4k() {
     acl_enforce(4096);
 }
+
+// --- ea_inode (large xattr values in dedicated inodes) ---
+
+/// Build a fresh image with extra mkfs feature options enabled.
+fn fresh_image_opts(block_size: u32, tag: &str, features: &str) -> PathBuf {
+    let dir = Path::new("target").join("harness");
+    fs::create_dir_all(&dir).unwrap();
+    let img = dir.join(format!("{}_{}.img", tag, block_size));
+    let _ = fs::remove_file(&img);
+    fs::write(&img, vec![0u8; 16 * 1024 * 1024]).unwrap();
+    let status = Command::new("mkfs.ext4")
+        .args(["-q", "-b", &block_size.to_string(), "-O", features, "-F"])
+        .arg(&img)
+        .status()
+        .expect("mkfs.ext4 failed to spawn");
+    assert!(status.success(), "mkfs.ext4 -O {features} failed");
+    img
+}
+
+/// A value too large for the xattr block is stored in a dedicated inode
+/// (ea_inode feature). e2fsck must validate it; the crate must read it back;
+/// removing it must free the value inode.
+fn xattr_ea_inode(block_size: u32) {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image_opts(block_size, "xattr_eai", "ea_inode");
+    let big = payload(5000);
+
+    let ino;
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "x.bin", reg_mode()).expect("create");
+        ino = f.inode_num;
+        ext4.xattr_set(ino, "user.big", &big, 0).expect("set big");
+        ext4.xattr_set(ino, "user.small", b"s", 0).expect("set small");
+    }
+    fsck_clean(&img);
+
+    {
+        let ext4 = open_fs(&img);
+        assert_eq!(ext4.xattr_get(ino, "user.big").unwrap(), big, "big value @ {block_size}");
+        assert_eq!(ext4.xattr_get(ino, "user.small").unwrap(), b"s", "small @ {block_size}");
+    }
+
+    // Remove the large attribute: its value inode must be freed.
+    {
+        let ext4 = open_fs(&img);
+        ext4.xattr_remove(ino, "user.big").expect("rm big");
+        ext4.xattr_remove(ino, "user.small").expect("rm small");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(ext4.xattr_list(ino).unwrap().is_empty(), "attrs remain @ {block_size}");
+}
+
+#[test]
+fn xattr_ea_inode_1k() {
+    xattr_ea_inode(1024);
+}
+#[test]
+fn xattr_ea_inode_4k() {
+    xattr_ea_inode(4096);
+}
