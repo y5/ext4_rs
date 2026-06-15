@@ -108,8 +108,13 @@ impl Ext4 {
             }
 
             prev_de_offset = offset;
-            // go to next entry
-            offset += de.entry_len() as usize;
+            // go to next entry; guard against a malformed zero-length entry
+            // that would otherwise spin forever.
+            let de_len = de.entry_len() as usize;
+            if de_len == 0 {
+                break;
+            }
+            offset += de_len;
         }
         return_errno_with_message!(Errno::ENOENT, "dir find in block failed");
     }
@@ -161,7 +166,12 @@ impl Ext4 {
                     if !de.unused() {
                         entries.push(de);
                     }
-                    offset += de.entry_len() as usize;
+                    // guard against a malformed zero-length entry (infinite loop)
+                    let de_len = de.entry_len() as usize;
+                    if de_len == 0 {
+                        break;
+                    }
+                    offset += de_len;
                 }
             }
 
@@ -387,15 +397,19 @@ impl Ext4 {
 
             // Find direct predecessor of removed entry
             while (offset + de_len as usize) < pos {
+                // A zero-length entry would never advance `offset`; bail out
+                // instead of looping forever on a malformed block.
+                if de_len == 0 {
+                    return_errno_with_message!(Errno::EINVAL, "dir remove: zero-length entry");
+                }
                 offset += de_len as usize;
                 tmp_de = ext4block.read_offset_as(offset);
                 de_len = tmp_de.entry_len();
             }
 
-            assert!(
-                de_len as usize + offset == pos,
-                "Invalid predecessor calculation"
-            );
+            if de_len as usize + offset != pos {
+                return_errno_with_message!(Errno::EINVAL, "Invalid predecessor calculation");
+            }
 
             // Add removed entry length to predecessor's length
             let del_len = result.dentry.entry_len();
@@ -444,7 +458,12 @@ impl Ext4 {
                 let mut offset = 0;
                 while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
                     let de: Ext4DirEntry = ext4block.read_offset_as(offset);
-                    offset += de.entry_len as usize;
+                    // guard against a malformed zero-length entry (infinite loop)
+                    let de_len = de.entry_len as usize;
+                    if de_len == 0 {
+                        break;
+                    }
+                    offset += de_len;
                     if de.inode == 0 {
                         continue;
                     }
