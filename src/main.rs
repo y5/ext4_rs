@@ -69,8 +69,8 @@ enum ColorCode {
 pub struct Disk {}
 
 impl BlockDevice for Disk {
-    fn read_offset(&self, offset: usize) -> Vec<u8> {
-        // log::info!("read_offset: {:x?}", offset);
+    fn read_offset(&self, offset: usize, len: usize) -> Vec<u8> {
+        // log::info!("read_offset: {:x?} len {:x?}", offset, len);
         use std::fs::OpenOptions;
         use std::io::{Read, Seek};
         let mut file = OpenOptions::new()
@@ -78,9 +78,17 @@ impl BlockDevice for Disk {
             .write(true)
             .open("ex4.img")
             .unwrap();
-        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+        let mut buf = vec![0u8; len];
         let _r = file.seek(std::io::SeekFrom::Start(offset as u64));
-        let _r = file.read_exact(&mut buf);
+        // Tolerate short reads at end-of-device (buffer stays zero-filled).
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => break,
+            }
+        }
 
         buf
     }

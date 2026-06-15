@@ -197,7 +197,7 @@ impl Ext4 {
             // Load block with bitmap
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
             let mut bitmap_block =
-                Block::load(&self.block_device, bmp_blk_adr as usize * BLOCK_SIZE);
+                Block::load(&self.block_device, bmp_blk_adr as usize * self.block_size(), self.block_size());
 
             // Check if goal is free
             if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
@@ -334,7 +334,7 @@ impl Ext4 {
             // Load block with bitmap
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
             let mut bitmap_block =
-                Block::load(&self.block_device, bmp_blk_adr as usize * BLOCK_SIZE);
+                Block::load(&self.block_device, bmp_blk_adr as usize * self.block_size(), self.block_size());
 
             // Check if goal is free
             if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
@@ -464,7 +464,7 @@ impl Ext4 {
             let block_bitmap_block = bg.get_block_bitmap_block(&super_block);
             let mut raw_data = self
                 .block_device
-                .read_offset(block_bitmap_block as usize * BLOCK_SIZE);
+                .read_offset(block_bitmap_block as usize * self.block_size(), self.block_size());
             let mut data: &mut Vec<u8> = &mut raw_data;
 
             // Number of blocks left in this group from idx_in_bg. The bitmap
@@ -593,7 +593,7 @@ impl Ext4 {
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
             let mut bitmap_data = self
                 .block_device
-                .read_offset(bmp_blk_adr as usize * BLOCK_SIZE);
+                .read_offset(bmp_blk_adr as usize * self.block_size(), self.block_size());
 
             // Compute indexes and limits
             let first_in_bg = self.get_block_of_bgid(bgid);

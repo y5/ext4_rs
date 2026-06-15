@@ -30,14 +30,16 @@ impl Ext4 {
             Ext4BlockGroup::load_new(&self.block_device, &super_block, group as usize);
         let inode_table_blk_num = block_group.get_inode_table_blk_num();
 
-        inode_table_blk_num as usize * BLOCK_SIZE + index as usize * inode_size as usize
+        inode_table_blk_num as usize * self.block_size() + index as usize * inode_size as usize
     }
 
     /// Load the inode reference from the disk.
     pub fn get_inode_ref(&self, inode_num: u32) -> Ext4InodeRef {
         let offset = self.inode_disk_pos(inode_num);
 
-        let mut ext4block = Block::load(&self.block_device, offset);
+        // Read one block from the inode's byte offset; the inode struct lies
+        // within it (inode_size <= block_size).
+        let mut ext4block = Block::load(&self.block_device, offset, self.block_size());
 
         let inode: &mut Ext4Inode = ext4block.read_as_mut();
 
@@ -107,7 +109,7 @@ impl Ext4 {
 
         let mut block_bmap_raw_data = self
             .block_device
-            .read_offset(block_bitmap_block as usize * BLOCK_SIZE);
+            .read_offset(block_bitmap_block as usize * self.block_size(), self.block_size());
         let mut data: &mut Vec<u8> = &mut block_bmap_raw_data;
         let mut rel_blk_idx = 0;
 
@@ -116,7 +118,7 @@ impl Ext4 {
 
         block_group.set_block_group_balloc_bitmap_csum(&super_block, data);
         self.block_device
-            .write_offset(block_bitmap_block as usize * BLOCK_SIZE, data);
+            .write_offset(block_bitmap_block as usize * self.block_size(), data);
 
         /* Update superblock free blocks count */
         let mut super_blk_free_blocks = super_block.free_blocks_count();
@@ -124,9 +126,9 @@ impl Ext4 {
         super_block.set_free_blocks_count(super_blk_free_blocks);
         super_block.sync_to_disk_with_csum(&self.block_device);
 
-        /* Update inode blocks (different block size!) count */
+        /* Update inode blocks (i_blocks is in 512-byte sectors) */
         let mut inode_blocks = inode_ref.inode.blocks_count();
-        inode_blocks += (BLOCK_SIZE / EXT4_INODE_BLOCK_SIZE) as u64;
+        inode_blocks += (self.block_size() / EXT4_INODE_BLOCK_SIZE) as u64;
         inode_ref.inode.set_blocks_count(inode_blocks);
         self.write_back_inode(inode_ref);
 
@@ -149,7 +151,7 @@ impl Ext4 {
     /// `Result<Ext4Fsblk>` - physical block id of the new block
     pub fn append_inode_pblk(&self, inode_ref: &mut Ext4InodeRef) -> Result<Ext4Fsblk> {
         let inode_size = inode_ref.inode.size();
-        let iblock = ((inode_size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let iblock = ((inode_size as usize + self.block_size() - 1) / self.block_size()) as u32;
 
         let mut newex: Ext4Extent = Ext4Extent::default();
 
@@ -163,7 +165,7 @@ impl Ext4 {
 
         // Update the inode size
         let mut inode_size = inode_ref.inode.size();
-        inode_size += BLOCK_SIZE as u64;
+        inode_size += self.block_size() as u64;
         inode_ref.inode.set_size(inode_size);
         self.write_back_inode(inode_ref);
 
@@ -184,7 +186,7 @@ impl Ext4 {
         start_bgid: &mut u32,
     ) -> Result<Ext4Fsblk> {
         let inode_size = inode_ref.inode.size();
-        let iblock = ((inode_size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let iblock = ((inode_size as usize + self.block_size() - 1) / self.block_size()) as u32;
 
         let mut newex: Ext4Extent = Ext4Extent::default();
 
@@ -198,7 +200,7 @@ impl Ext4 {
 
         // Update the inode size
         let mut inode_size = inode_ref.inode.size();
-        inode_size += BLOCK_SIZE as u64;
+        inode_size += self.block_size() as u64;
         inode_ref.inode.set_size(inode_size);
         self.write_back_inode(inode_ref);
 
@@ -362,7 +364,7 @@ impl Ext4 {
         block_count: usize,
     ) -> Result<Vec<Ext4Fsblk>> {
         let inode_size = inode_ref.inode.size();
-        let iblock = ((inode_size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let iblock = ((inode_size as usize + self.block_size() - 1) / self.block_size()) as u32;
 
         // Append after the end of the last extent (falling back to the EOF block
         // computed from the inode size if the tree can't be walked).
@@ -384,7 +386,7 @@ impl Ext4 {
         }
 
         // Grow the inode size by the number of blocks actually appended.
-        let new_size = match inode_size.checked_add((allocated_blocks.len() * BLOCK_SIZE) as u64) {
+        let new_size = match inode_size.checked_add((allocated_blocks.len() * self.block_size()) as u64) {
             Some(v) => v,
             None => return return_errno_with_message!(Errno::EINVAL, "File size overflow"),
         };
@@ -406,7 +408,11 @@ impl Ext4 {
         let mut depth = root_header.depth;
 
         while depth > 0 {
-            let index_block = Block::load(&self.block_device, current_block as usize * BLOCK_SIZE);
+            let index_block = Block::load(
+                &self.block_device,
+                current_block as usize * self.block_size(),
+                self.block_size(),
+            );
             let index_header = Ext4ExtentHeader::load_from_u8(&index_block.data[..]);
             if index_header.entries_count == 0 {
                 return return_errno_with_message!(Errno::ENOENT, "Invalid extent tree");
@@ -423,7 +429,11 @@ impl Ext4 {
         }
 
         // Get the last extent entry
-        let extent_block = Block::load(&self.block_device, current_block as usize * BLOCK_SIZE);
+        let extent_block = Block::load(
+            &self.block_device,
+            current_block as usize * self.block_size(),
+            self.block_size(),
+        );
         let extent_header = Ext4ExtentHeader::load_from_u8(&extent_block.data[..]);
         if extent_header.entries_count == 0 {
             return return_errno_with_message!(Errno::ENOENT, "No extent entries found");

@@ -5,6 +5,11 @@ use crate::utils::*;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    /// The filesystem block size in bytes, read from the superblock.
+    pub fn block_size(&self) -> usize {
+        self.super_block.block_size() as usize
+    }
+
     /// 获取system zone缓存
     pub fn get_system_zone(&self) -> Vec<SystemZone> {
         let mut zones = Vec::new();
@@ -54,8 +59,9 @@ impl Ext4 {
     }
     /// Opens and loads an Ext4 from the `block_device`.
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Self {
-        // Load the superblock
-        let block = Block::load(&block_device, SUPERBLOCK_OFFSET);
+        // Load the superblock. It lives at byte 1024 and is 1024 bytes; the
+        // block size isn't known yet, so read a fixed amount.
+        let block = Block::load(&block_device, SUPERBLOCK_OFFSET, SUPERBLOCK_OFFSET);
         let super_block: Ext4Superblock = block.read_as();
 
         // drop(block);

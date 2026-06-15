@@ -1,7 +1,9 @@
 use crate::prelude::*;
 
 pub trait BlockDevice: Send + Sync + Any {
-    fn read_offset(&self, offset: usize) -> Vec<u8>;
+    /// Read `len` bytes starting at byte `offset`. Implementations should
+    /// tolerate short reads at end-of-device (zero-fill the remainder).
+    fn read_offset(&self, offset: usize, len: usize) -> Vec<u8>;
     fn write_offset(&self, offset: usize, data: &[u8]);
 }
 
@@ -11,9 +13,9 @@ pub struct Block {
 }
 
 impl Block {
-    /// Load the block from the disk.
-    pub fn load(block_device: &Arc<dyn BlockDevice>, offset: usize) -> Self {
-        let data = block_device.read_offset(offset);
+    /// Load `len` bytes from the disk at byte `offset` (usually one fs block).
+    pub fn load(block_device: &Arc<dyn BlockDevice>, offset: usize, len: usize) -> Self {
+        let data = block_device.read_offset(offset, len);
         Block {
             disk_offset: offset,
             data,

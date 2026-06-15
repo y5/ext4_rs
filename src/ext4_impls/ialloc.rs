@@ -22,7 +22,7 @@ impl Ext4 {
 
                 let mut raw_data = self
                     .block_device
-                    .read_offset(inode_bitmap_block as usize * BLOCK_SIZE);
+                    .read_offset(inode_bitmap_block as usize * self.block_size(), self.block_size());
 
                 let inodes_in_bg = super_block.get_inodes_in_group_cnt(bgid);
 
@@ -93,7 +93,7 @@ impl Ext4 {
         let inode_bitmap_block = bg.get_inode_bitmap_block(&self.super_block);
         let mut bitmap_data = self
             .block_device
-            .read_offset(inode_bitmap_block as usize * BLOCK_SIZE);
+            .read_offset(inode_bitmap_block as usize * self.block_size(), self.block_size());
 
         // Find index within group and clear bit
         let index_in_group = self.inode_to_bgidx(index);
