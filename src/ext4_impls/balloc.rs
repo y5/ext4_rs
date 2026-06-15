@@ -445,16 +445,17 @@ impl Ext4 {
 
         let mut super_block = self.super_block;
 
-        let blocks_per_group = super_block.blocks_per_group();
-
-        let mut bg_first = start / blocks_per_group as u64;
-        let mut bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
+        // Derive group/index through the same helpers the allocator uses so the
+        // free path stays symmetric with it. With first_data_block != 0 (1 KiB
+        // blocks) these subtract 1; raw division would clear the wrong bit.
+        let mut bg_first = self.get_bgid_of_block(start) as u64;
+        let mut bg_last = self.get_bgid_of_block(start + count as u64 - 1) as u64;
 
         while bg_first <= bg_last {
             // Recompute the group from the current `start`; a free range may span
             // multiple groups, and `start` advances by `free_cnt` each iteration.
-            let bgid = start / blocks_per_group as u64;
-            let idx_in_bg = start % blocks_per_group as u64;
+            let bgid = self.get_bgid_of_block(start) as u64;
+            let idx_in_bg = self.addr_to_idx_bg(start) as u64;
 
             let mut bg = Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
 
