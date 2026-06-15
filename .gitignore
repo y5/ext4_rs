@@ -2,3 +2,4 @@
 *.img
 test_files*
 tmp
+/docs
