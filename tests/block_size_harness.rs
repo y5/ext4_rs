@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use ext4_rs::{BlockDevice, Ext4, InodeFileType};
+use ext4_rs::{BlockDevice, Errno, Ext4, InodeFileType};
 
 const ROOT_INODE: u32 = 2;
 
@@ -412,6 +412,129 @@ fn rmdir_roundtrip(block_size: u32) {
     let ext4 = open_fs(&img);
     let r = ext4.generic_open("/rmd", &mut ROOT_INODE.clone(), false, 0, &mut 0);
     assert!(r.is_err(), "removed dir still resolves @ {block_size}");
+}
+
+/// Create a nested directory, then remove it leaf-first. Exercises rmdir of a
+/// subdirectory whose parent is not the root (nested link-count accounting).
+fn nested_rmdir(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "nested");
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.dir_mk("/a").expect("mkdir /a");
+        ext4.dir_mk("/a/b").expect("mkdir /a/b");
+    }
+    fsck_clean(&img);
+
+    {
+        let ext4 = open_fs(&img);
+        let a = ext4
+            .generic_open("/a", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("resolve /a");
+        ext4.dir_remove(a, "b").expect("rmdir /a/b");
+    }
+    fsck_clean(&img);
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.dir_remove(ROOT_INODE, "a").expect("rmdir /a");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let r = ext4.generic_open("/a", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+    assert!(r.is_err(), "removed nested dir still resolves @ {block_size}");
+}
+
+/// rmdir on a non-empty directory must fail with ENOTEMPTY and leave the
+/// filesystem (and the directory's contents) intact.
+fn rmdir_nonempty(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rmdirne");
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.dir_mk("/d").expect("mkdir /d");
+        let d = ext4
+            .generic_open("/d", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("resolve /d");
+        let f = ext4.create(d, "f.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &payload(2000)).expect("write");
+    }
+    fsck_clean(&img);
+
+    {
+        let ext4 = open_fs(&img);
+        let r = ext4.dir_remove(ROOT_INODE, "d");
+        assert!(r.is_err(), "rmdir of non-empty dir succeeded @ {block_size}");
+        assert_eq!(
+            r.unwrap_err().error(),
+            Errno::ENOTEMPTY,
+            "rmdir non-empty wrong errno @ {block_size}"
+        );
+    }
+    fsck_clean(&img); // the failed rmdir must not have corrupted anything
+
+    let ext4 = open_fs(&img);
+    let r = ext4.generic_open("/d/f.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+    assert!(r.is_ok(), "/d/f.bin lost after failed rmdir @ {block_size}");
+}
+
+/// Write a file large enough to span a block-group boundary, then delete it.
+/// At 1 KiB blocks a 16 MiB image is two groups (boundary ~8 MiB), so the
+/// delete frees a range crossing the boundary, exercising balloc_free_blocks'
+/// per-iteration group recomputation. e2fsck must stay clean.
+fn multigroup_free(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "multigroup");
+    let big = payload(9 * 1024 * 1024); // 9 MiB > the 8 MiB group boundary at 1 KiB
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "big.bin", reg_mode()).expect("create");
+        let n = ext4.write_at(f.inode_num, 0, &big).expect("write big.bin");
+        assert_eq!(n, big.len(), "short write @ {block_size}");
+    }
+    fsck_clean(&img); // a large multi-group file is consistent
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.file_remove("/big.bin").expect("remove big.bin");
+    }
+    fsck_clean(&img); // the cross-group free leaves the filesystem consistent
+
+    let ext4 = open_fs(&img);
+    let r = ext4.generic_open("/big.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+    assert!(r.is_err(), "removed big.bin still resolves @ {block_size}");
+}
+
+#[test]
+fn multigroup_free_1k() {
+    multigroup_free(1024);
+}
+
+#[test]
+fn nested_rmdir_1k() {
+    nested_rmdir(1024);
+}
+#[test]
+fn nested_rmdir_4k() {
+    nested_rmdir(4096);
+}
+#[test]
+fn rmdir_nonempty_1k() {
+    rmdir_nonempty(1024);
+}
+#[test]
+fn rmdir_nonempty_4k() {
+    rmdir_nonempty(4096);
 }
 
 #[test]
