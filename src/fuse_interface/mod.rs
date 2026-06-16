@@ -268,6 +268,10 @@ impl Ext4 {
 
     /// Remove a file.
     pub fn fuse_unlink(&self, parent: u64, name: &str) -> Result<usize> {
+        self.journaled(|| self.fuse_unlink_impl(parent, name))
+    }
+
+    fn fuse_unlink_impl(&self, parent: u64, name: &str) -> Result<usize> {
         // unlink actual remove a file
 
         // get child inode num
@@ -295,25 +299,16 @@ impl Ext4 {
     }
     /// Remove a directory.
     pub fn fuse_rmdir(&mut self, parent: u64, name: &str) -> Result<usize> {
-        let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.journaled_mut(|s| s.fuse_rmdir_impl(parent, name))
+    }
 
-        let r = self.dir_find_entry(parent as u32, name, &mut search_result)?;
-
-        let mut parent_inode_ref = self.get_inode_ref(parent as u32);
-        let mut child_inode_ref = self.get_inode_ref(search_result.dentry.inode);
-
-        self.truncate_inode(&mut child_inode_ref, 0)?;
-
-        self.unlink(&mut parent_inode_ref, &mut child_inode_ref, name)?;
-
-        self.write_back_inode(&mut parent_inode_ref);
-
-        // to do
-        // ext4_inode_set_del_time
-        // ext4_inode_set_links_cnt
-        // ext4_fs_free_inode(&child)
-
-        Ok(EOK)
+    fn fuse_rmdir_impl(&mut self, parent: u64, name: &str) -> Result<usize> {
+        // Delegate to the dir_remove primitive, which removes the entry, frees
+        // the empty directory's inode, and drops the parent's '..' back-link.
+        // The previous hand-rolled body left the child inode allocated and the
+        // parent link count too high (the `to do` notes below were never done),
+        // so e2fsck saw an unconnected inode and a wrong reference count.
+        self.dir_remove(parent as u32, name)
     }
     /// Create a symbolic link.
     pub fn fuse_symlink(&mut self, parent: u64, link_name: &str, target: &str) -> Result<usize> {
@@ -645,6 +640,17 @@ impl Ext4 {
 
     /// Rename a file.
     pub fn fuse_rename(
+        &mut self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        flags: u32,
+    ) -> Result<usize> {
+        self.journaled_mut(|s| s.fuse_rename_impl(parent, name, newparent, newname, flags))
+    }
+
+    fn fuse_rename_impl(
         &mut self,
         parent: u64,
         name: &str,

@@ -269,6 +269,15 @@ impl Ext4 {
         child: &mut Ext4InodeRef,
         name: &str,
     ) -> Result<usize> {
+        self.journaled(|| self.unlink_impl(parent, child, name))
+    }
+
+    fn unlink_impl(
+        &self,
+        parent: &mut Ext4InodeRef,
+        child: &mut Ext4InodeRef,
+        name: &str,
+    ) -> Result<usize> {
         self.dir_remove_entry(parent, name)?;
 
         // Drop the directory's link to the child and persist it. Without this

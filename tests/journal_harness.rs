@@ -934,6 +934,105 @@ fn journaled_failed_op_aborts_cleanly_4k() {
     fsck_clean(&img);
 }
 
+// ---------------------------------------------------------------------------
+// Journaled removal/rename ops (Task 6.3): unlink/rmdir/rename wrapped in a
+// transaction. The object is created+committed in its own session first, then a
+// SEPARATE session injects a crash at the removal/rename's own commit
+// (AfterCommitBlock). Recovery on the next mount replays the durable-but-
+// uncheckpointed txn, so the removal/rename takes effect atomically and the
+// image is e2fsck-clean.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journaled_unlink_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "junlink");
+    {
+        // Create the file durably (committed + checkpointed) first.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.create(ROOT_INODE, "u.bin", reg_mode()).expect("create");
+    }
+    {
+        // Separate session: crash at the unlink's own commit.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.fuse_unlink(ROOT_INODE as u64, "u.bin").expect("unlink");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        // The file must be gone after recovery.
+        let r = fs.generic_open("/u.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+        assert!(r.is_err(), "unlinked file must be gone after recovery");
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn journaled_rmdir_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jrmdir");
+    {
+        // Create the empty directory durably first.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.fuse_mkdir(
+            ROOT_INODE as u64,
+            "d",
+            InodeFileType::S_IFDIR.bits() as u32,
+            0,
+        )
+        .expect("mkdir");
+    }
+    {
+        // Separate session: crash at the rmdir's own commit.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.fuse_rmdir(ROOT_INODE as u64, "d").expect("rmdir");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let r = fs.generic_open("/d", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+        assert!(r.is_err(), "removed dir must be gone after recovery");
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn journaled_rename_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jrename");
+    {
+        // Create "/a" durably first.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.create(ROOT_INODE, "a", reg_mode()).expect("create");
+    }
+    {
+        // Separate session: crash at the rename's own commit. Rename touches
+        // multiple directory entries and must recover atomically.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        // fuse_rename(parent, name, newparent, newname, flags); flags 0 = plain.
+        fs.fuse_rename(ROOT_INODE as u64, "a", ROOT_INODE as u64, "b", 0)
+            .expect("rename");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let new = fs.generic_open("/b", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+        assert!(new.is_ok(), "new name /b must exist after recovery");
+        let old = fs.generic_open("/a", &mut ROOT_INODE.clone(), false, 0, &mut 0);
+        assert!(old.is_err(), "old name /a must be gone after recovery");
+    }
+    fsck_clean(&img);
+}
+
 #[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);
