@@ -10,6 +10,9 @@ use crate::return_errno_with_message;
 mod transaction;
 pub use transaction::*;
 
+mod device;
+pub use device::*;
+
 // Re-export the jbd2 on-disk codec (defined in `ext4_defs::journal`) so it is
 // reachable from the crate root alongside the `Journal` engine. Recovery and the
 // test harness assemble/parse/verify log blocks with these.
