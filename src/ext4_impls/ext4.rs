@@ -86,6 +86,8 @@ impl Ext4 {
             super_block,
             system_zone_cache: None,
             locks: BTreeMap::new(),
+            journal_device: None,
+            journal: None,
         };
         let zones = ext4_tmp.get_system_zone();
 
@@ -104,6 +106,46 @@ impl Ext4 {
             journal.recover(&fs)?; // no-op when the journal is clean
         }
         Ok(fs)
+    }
+
+    /// Open the fs with journaling enabled: wrap the device in a JournalDevice,
+    /// recover any dirty journal, and store the engine so mutating ops are journaled.
+    /// Falls back to a plain (un-journaled) open if the fs has no journal.
+    pub fn open_journaled(file_dev: Arc<dyn BlockDevice>) -> Result<Self> {
+        use crate::ext4_impls::journal::{Journal, JournalDevice};
+        let bs = Ext4::open(file_dev.clone()).block_size(); // probe block size
+        let jdev = Arc::new(JournalDevice::new(file_dev, bs));
+        let mut fs = Ext4::open(jdev.clone()); // block_device = jdev (inactive → passthrough)
+        if let Some(journal) = Journal::load(&fs)? {
+            journal.recover(&fs)?; // replay a dirty journal (jdev passthrough)
+            fs.journal = Some(journal);
+            fs.journal_device = Some(jdev);
+        }
+        Ok(fs)
+    }
+
+    /// Begin the running transaction for a mutating op (no-op if not journaled).
+    pub fn journal_begin(&self) -> Result<()> {
+        if let (Some(jd), Some(j)) = (&self.journal_device, &self.journal) {
+            let seq = j.live_sequence(self)?;
+            jd.begin(seq);
+        }
+        Ok(())
+    }
+
+    /// End a mutating op: commit the transaction if `ok`, else discard it (no-op if
+    /// not journaled). Honors a test-injected crash point.
+    pub fn journal_end(&self, ok: bool) -> Result<()> {
+        if let (Some(jd), Some(j)) = (&self.journal_device, &self.journal) {
+            if let Some(txn) = jd.end() {
+                if ok {
+                    let crash = jd.take_crash();
+                    j.commit_with_crash(self, &txn, crash)?;
+                }
+                // if !ok: drop txn → captured writes never hit disk (atomic abort)
+            }
+        }
+        Ok(())
     }
 
     // with dir result search path offset

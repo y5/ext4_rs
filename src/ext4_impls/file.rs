@@ -349,7 +349,20 @@ impl Ext4 {
     ///
     /// Returns:
     /// `Result<usize>` - number of bytes written
+    ///
+    /// When the fs was opened via `open_journaled`, the write is wrapped in a
+    /// journal transaction (begin → impl → end). `journal_end` runs whether the
+    /// impl succeeds or fails, so a failed write discards its captured blocks
+    /// (atomic abort). On a plain `open` both begin/end are no-ops, so this is a
+    /// pure pass-through to `write_at_impl` with identical behavior.
     pub fn write_at(&self, inode: u32, offset: usize, write_buf: &[u8]) -> Result<usize> {
+        self.journal_begin()?;
+        let r = self.write_at_impl(inode, offset, write_buf);
+        self.journal_end(r.is_ok())?;
+        r
+    }
+
+    fn write_at_impl(&self, inode: u32, offset: usize, write_buf: &[u8]) -> Result<usize> {
         // write buf is empty, return 0
         let mut write_buf_len = write_buf.len();
         if write_buf_len == 0 {

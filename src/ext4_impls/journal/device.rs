@@ -9,6 +9,7 @@
 use crate::prelude::*;
 use crate::ext4_defs::BlockDevice;
 use super::transaction::Transaction;
+use super::CrashPoint;
 use spin::Mutex;
 
 /// Interior, mutex-guarded state: the running transaction (if any) and the
@@ -16,6 +17,9 @@ use spin::Mutex;
 struct DevState {
     txn: Option<Transaction>,
     depth: u32,
+    /// A pending test-injected crash point, applied to the next commit then
+    /// reset to `None`. Defaults to `None` (normal full commit).
+    crash: CrashPoint,
 }
 
 /// A `BlockDevice` wrapper that captures writes into a running journal
@@ -38,7 +42,7 @@ impl JournalDevice {
         JournalDevice {
             inner,
             block_size,
-            state: Mutex::new(DevState { txn: None, depth: 0 }),
+            state: Mutex::new(DevState { txn: None, depth: 0, crash: CrashPoint::None }),
         }
     }
 
@@ -77,6 +81,17 @@ impl JournalDevice {
 
     pub fn is_active(&self) -> bool {
         self.state.lock().depth > 0
+    }
+
+    /// Test hook: the next commit will simulate this crash point, then reset to None.
+    pub fn set_crash(&self, c: CrashPoint) {
+        self.state.lock().crash = c;
+    }
+
+    /// Take (and clear) the pending crash point. Returns None if unset.
+    pub fn take_crash(&self) -> CrashPoint {
+        let mut s = self.state.lock();
+        core::mem::replace(&mut s.crash, CrashPoint::None)
     }
 
     /// Record a revoke in the running transaction (no-op if none open).

@@ -136,6 +136,14 @@ impl Journal {
         }
     }
 
+    /// The live on-disk journal sequence (s_sequence), read fresh from log block
+    /// 0. This is the sequence the next transaction must commit at; the running
+    /// transaction is begun with it so the log we emit matches what recovery
+    /// expects.
+    pub fn live_sequence(&self, fs: &Ext4) -> Result<u32> {
+        Ok(self.live_sb(fs)?.sb.sequence)
+    }
+
     /// Map a journal-file logical block index to its physical fs block.
     pub fn map_log_block(&self, fs: &Ext4, log_block: Ext4Lblk) -> Result<Ext4Fsblk> {
         fs.get_pblock_idx(&self.inode_ref, log_block)

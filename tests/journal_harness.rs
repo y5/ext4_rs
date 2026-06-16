@@ -747,6 +747,55 @@ fn revoke_recorded_in_txn_is_emitted_and_read_back_4k() {
 }
 
 #[test]
+fn journaled_write_is_consistent_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jintwrite");
+    let content = vec![0x77u8; 4096];
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "w.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &content).expect("write"); // auto-journaled
+    }
+    // Reopen plainly; the write was committed+checkpointed.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        let ino = fs.generic_open("/w.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0).expect("open");
+        let mut buf = vec![0u8; content.len()];
+        fs.read_at(ino, 0, &mut buf).expect("read");
+        assert_eq!(buf, content);
+        assert_eq!(Journal::load(&fs).unwrap().unwrap().sb.start, 0, "journal clean");
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn journaled_write_crash_before_checkpoint_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jintcrash");
+    let content = vec![0x33u8; 4096];
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "wc.bin", reg_mode()).expect("create");
+        // Make the write's commit crash before checkpoint.
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.write_at(f.inode_num, 0, &content).expect("write"); // commits to journal, crashes before checkpoint
+    }
+    // Recover on next mount: the write must be present and consistent.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs.generic_open("/wc.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0).expect("open");
+        let mut buf = vec![0u8; content.len()];
+        fs.read_at(ino, 0, &mut buf).expect("read");
+        assert_eq!(buf, content, "write recovered after crash-before-checkpoint");
+    }
+    fsck_clean(&img);
+}
+
+#[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);
 }

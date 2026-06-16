@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::ext4_impls::journal::{Journal, JournalDevice};
 
 use super::*;
 
@@ -34,4 +35,9 @@ pub struct Ext4 {
     /// kernel's, these are process/runtime state and are never persisted to
     /// disk. Maintained by `fuse_setlk`/`fuse_getlk`.
     pub locks: BTreeMap<u32, Vec<FileLock>>,
+    /// Typed handle to the journaling block-device wrapper (Some when opened via
+    /// `open_journaled`). Used to begin/end the running transaction.
+    pub journal_device: Option<Arc<JournalDevice>>,
+    /// The journal engine (Some when a journal is present and journaling is on).
+    pub journal: Option<Journal>,
 }
