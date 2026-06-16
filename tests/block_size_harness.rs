@@ -2659,3 +2659,28 @@ fn posix_locks_conflict_and_release() {
     let after = ext4.fuse_getlk(ino, 0, C, 200, 300, F_WRLCK, 3).unwrap();
     assert_eq!((after.typ, after.owner), (F_RDLCK, B));
 }
+
+#[test]
+fn poll_reports_regular_file_always_ready() {
+    const POLLIN: u32 = 0x001;
+    const POLLPRI: u32 = 0x002;
+    const POLLOUT: u32 = 0x004;
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(4096, "poll");
+    let ext4 = open_fs(&img);
+    let f = ext4.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+    let ino = f.inode_num as u64;
+
+    // A regular file never blocks: the requested read/write readiness is ready.
+    assert_eq!(
+        ext4.fuse_poll(ino, 0, 0, POLLIN | POLLOUT, 0).expect("poll"),
+        POLLIN | POLLOUT
+    );
+    // Events we don't signal (POLLPRI, out-of-band) are not reported ready.
+    assert_eq!(
+        ext4.fuse_poll(ino, 0, 0, POLLIN | POLLPRI, 0).expect("poll"),
+        POLLIN
+    );
+}

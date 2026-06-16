@@ -1115,17 +1115,31 @@ impl Ext4 {
         }
     }
 
-    /// Poll for events
-    // #[cfg(feature = "abi-7-11")]
-    // fn fuse_poll(
-    //     &mut self,
-    //     ino: u64,
-    //     fh: u64,
-    //     kh: u64,
-    //     events: u32,
-    //     flags: u32,
-    // ) {
-    // }
+    /// Poll for events.
+    ///
+    /// `events` is the mask the caller is waiting on; the reply is the subset
+    /// that is currently ready (`revents`). A regular file on an on-disk
+    /// filesystem never blocks — it is always readable and writable — so we
+    /// report the requested read/write readiness immediately and never register
+    /// the `kh` poll handle for later notification. Out-of-band / priority
+    /// events (`POLLPRI` and friends) are never signalled.
+    pub fn fuse_poll(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _kh: u64,
+        events: u32,
+        _flags: u32,
+    ) -> Result<u32> {
+        // Standard poll readiness bits for a never-blocking file.
+        const POLLIN: u32 = 0x001;
+        const POLLOUT: u32 = 0x004;
+        const POLLRDNORM: u32 = 0x040;
+        const POLLWRNORM: u32 = 0x100;
+        const READY: u32 = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
+
+        Ok(events & READY)
+    }
 
     /// Preallocate or deallocate space to a file.
     ///
