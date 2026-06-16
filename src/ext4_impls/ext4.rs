@@ -163,6 +163,16 @@ impl Ext4 {
         r
     }
 
+    /// Leak-safe journaling wrapper for `&mut self` operations. Same contract as
+    /// `journaled` (begin → op → commit-or-abort, no-op when not journaled), but the
+    /// op receives `&mut Self`. Use this for fuse ops that need `&mut self`.
+    pub fn journaled_mut<T>(&mut self, op: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.journal_begin()?;
+        let r = op(self);
+        self.journal_end(r.is_ok())?;
+        r
+    }
+
     // with dir result search path offset
     pub fn generic_open(
         &self,

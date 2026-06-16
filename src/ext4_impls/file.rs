@@ -21,6 +21,15 @@ impl Ext4 {
         child: &mut Ext4InodeRef,
         name: &str,
     ) -> Result<usize> {
+        self.journaled(|| self.link_impl(parent, child, name))
+    }
+
+    fn link_impl(
+        &self,
+        parent: &mut Ext4InodeRef,
+        child: &mut Ext4InodeRef,
+        name: &str,
+    ) -> Result<usize> {
         // Add a directory entry in the parent directory pointing to the child inode
 
         // at this point should insert to existing block
@@ -66,6 +75,10 @@ impl Ext4 {
     ///
     /// Returns:
     pub fn create(&self, parent: u32, name: &str, inode_mode: u16) -> Result<Ext4InodeRef> {
+        self.journaled(|| self.create_impl(parent, name, inode_mode))
+    }
+
+    fn create_impl(&self, parent: u32, name: &str, inode_mode: u16) -> Result<Ext4InodeRef> {
         let mut parent_inode_ref = self.get_inode_ref(parent);
 
         // let mut child_inode_ref = self.create_inode(inode_mode)?;
@@ -166,6 +179,17 @@ impl Ext4 {
         uid: u16,
         gid: u16,
     ) -> Result<Ext4InodeRef> {
+        self.journaled(|| self.create_with_attr_impl(parent, name, inode_mode, uid, gid))
+    }
+
+    fn create_with_attr_impl(
+        &self,
+        parent: u32,
+        name: &str,
+        inode_mode: u16,
+        uid: u16,
+        gid: u16,
+    ) -> Result<Ext4InodeRef> {
         let mut parent_inode_ref = self.get_inode_ref(parent);
 
         // let mut child_inode_ref = self.create_inode(inode_mode)?;
@@ -191,6 +215,20 @@ impl Ext4 {
     /// nodes. Mirrors `create_with_attr` but routes through the device-aware
     /// inode initializer.
     pub fn create_special_with_attr(
+        &self,
+        parent: u32,
+        name: &str,
+        inode_mode: u16,
+        rdev: u32,
+        uid: u16,
+        gid: u16,
+    ) -> Result<Ext4InodeRef> {
+        self.journaled(|| {
+            self.create_special_with_attr_impl(parent, name, inode_mode, rdev, uid, gid)
+        })
+    }
+
+    fn create_special_with_attr_impl(
         &self,
         parent: u32,
         name: &str,

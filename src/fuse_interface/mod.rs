@@ -142,6 +142,17 @@ impl Ext4 {
         umask: u32,
         rdev: u32,
     ) -> Result<Ext4InodeRef> {
+        self.journaled(|| self.fuse_mknod_impl(parent, name, mode, umask, rdev))
+    }
+
+    fn fuse_mknod_impl(
+        &self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+    ) -> Result<Ext4InodeRef> {
         let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
         let r = self.dir_find_entry(parent as u32, name, &mut search_result);
         if r.is_ok() {
@@ -155,6 +166,19 @@ impl Ext4 {
 
     /// Create a regular file, character device, block device, fifo or socket node.
     pub fn fuse_mknod_with_attr(
+        &self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Ext4InodeRef> {
+        self.journaled(|| self.fuse_mknod_with_attr_impl(parent, name, mode, umask, rdev, uid, gid))
+    }
+
+    fn fuse_mknod_with_attr_impl(
         &self,
         parent: u64,
         name: &str,
@@ -183,6 +207,10 @@ impl Ext4 {
 
     /// Create a directory.
     pub fn fuse_mkdir(&mut self, parent: u64, name: &str, mode: u32, umask: u32) -> Result<usize> {
+        self.journaled_mut(|s| s.fuse_mkdir_impl(parent, name, mode, umask))
+    }
+
+    fn fuse_mkdir_impl(&mut self, parent: u64, name: &str, mode: u32, umask: u32) -> Result<usize> {
         let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
         let r = self.dir_find_entry(parent as u32, name, &mut search_result);
         if r.is_ok() {
@@ -200,6 +228,18 @@ impl Ext4 {
 
     /// Create a directory.
     pub fn fuse_mkdir_with_attr(
+        &mut self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Ext4InodeRef> {
+        self.journaled_mut(|s| s.fuse_mkdir_with_attr_impl(parent, name, mode, umask, uid, gid))
+    }
+
+    fn fuse_mkdir_with_attr_impl(
         &mut self,
         parent: u64,
         name: &str,
@@ -277,6 +317,10 @@ impl Ext4 {
     }
     /// Create a symbolic link.
     pub fn fuse_symlink(&mut self, parent: u64, link_name: &str, target: &str) -> Result<usize> {
+        self.journaled_mut(|s| s.fuse_symlink_impl(parent, link_name, target))
+    }
+
+    fn fuse_symlink_impl(&mut self, parent: u64, link_name: &str, target: &str) -> Result<usize> {
         let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
         let r = self.dir_find_entry(parent as u32, link_name, &mut search_result);
         if r.is_ok() {
@@ -343,6 +387,10 @@ impl Ext4 {
     ///
     ///
     pub fn fuse_link(&mut self, ino: u64, newparent: u64, newname: &str) -> Result<usize> {
+        self.journaled_mut(|s| s.fuse_link_impl(ino, newparent, newname))
+    }
+
+    fn fuse_link_impl(&mut self, ino: u64, newparent: u64, newname: &str) -> Result<usize> {
         let mut parent_inode_ref = self.get_inode_ref(newparent as u32);
         let mut child_inode_ref = self.get_inode_ref(ino as u32);
 
@@ -497,6 +545,17 @@ impl Ext4 {
     /// implemented or under Linux kernel versions earlier than 2.6.15, the mknod()
     /// and open() methods will be called instead.
     pub fn fuse_create(
+        &mut self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+    ) -> Result<usize> {
+        self.journaled_mut(|s| s.fuse_create_impl(parent, name, mode, umask, flags))
+    }
+
+    fn fuse_create_impl(
         &mut self,
         parent: u64,
         name: &str,

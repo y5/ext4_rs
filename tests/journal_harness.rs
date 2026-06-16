@@ -795,6 +795,145 @@ fn journaled_write_crash_before_checkpoint_recovers_4k() {
     fsck_clean(&img);
 }
 
+// ---------------------------------------------------------------------------
+// Journaled creation ops (Task 6.2): create/mkdir/symlink/link wrapped in a
+// transaction. A crash at the op's own commit (AfterCommitBlock) leaves the
+// txn durable-but-uncheckpointed; recovery on the next mount must replay it,
+// yielding a consistent (e2fsck-clean) fs with the created object present.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journaled_create_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jcreate");
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        // `create` is itself journaled now; this commits then crashes pre-checkpoint.
+        fs.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/f.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("file present after recovery");
+        assert!(ino >= 2);
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn journaled_mkdir_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jmkdir");
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.fuse_mkdir(
+            ROOT_INODE as u64,
+            "d",
+            InodeFileType::S_IFDIR.bits() as u32,
+            0,
+        )
+        .expect("mkdir");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/d", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("dir present");
+        assert!(ino >= 2);
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn journaled_symlink_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jsymlink");
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.fuse_symlink(ROOT_INODE as u64, "lnk", "/some/target").expect("symlink");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/lnk", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("symlink present");
+        assert!(ino >= 2);
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn journaled_link_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jhardlink");
+    let target_ino;
+    {
+        // Create the link target first (its own committed+checkpointed txn),
+        // then hard-link to it with a crash at the link's commit.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "tgt.bin", reg_mode()).expect("create target");
+        target_ino = f.inode_num;
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.fuse_link(target_ino as u64, ROOT_INODE as u64, "hard").expect("link");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        // both the original name and the new hard link resolve.
+        let a = fs
+            .generic_open("/tgt.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("target present");
+        let b = fs
+            .generic_open("/hard", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("hard link present");
+        assert_eq!(a, b, "hard link points at the same inode");
+        assert_eq!(a, target_ino);
+    }
+    fsck_clean(&img);
+}
+
+/// A creation op that FAILS (mkdir of an existing name → EEXIST) on a journaled
+/// fs must leave the fs consistent: the failing op's transaction is discarded
+/// (atomic abort via `journal_end(false)`), so no stray object is created and
+/// the result is e2fsck-clean.
+#[test]
+fn journaled_failed_op_aborts_cleanly_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jabort");
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let mode = InodeFileType::S_IFDIR.bits() as u32;
+        // First mkdir succeeds (committed + checkpointed).
+        fs.fuse_mkdir(ROOT_INODE as u64, "dup", mode, 0).expect("first mkdir");
+        // Second mkdir of the same name must fail with EEXIST → its txn aborts.
+        let err = fs.fuse_mkdir(ROOT_INODE as u64, "dup", mode, 0);
+        assert!(err.is_err(), "duplicate mkdir must fail");
+    }
+    {
+        // Recover (clean journal) and confirm exactly one "dup" exists and the
+        // fs is consistent.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/dup", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("the one good dir is present");
+        assert!(ino >= 2);
+    }
+    fsck_clean(&img);
+}
+
 #[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);
