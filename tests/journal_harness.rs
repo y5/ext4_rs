@@ -630,6 +630,59 @@ fn crash_before_checkpoint_recovers(block_size: u32) {
     fsck_clean(&img);
 }
 
+/// A crash PART-WAY through checkpointing leaves some final-location blocks
+/// written and others not, with the journal still dirty. Recovery must replay the
+/// WHOLE transaction — rewriting the already-written blocks with identical bytes
+/// (idempotent) and completing the rest — yielding a consistent fs. Parameterized
+/// over block size. Recovery itself must also be idempotent: a second mount is a
+/// harmless no-op.
+fn crash_mid_checkpoint_is_idempotent(block_size: u32) {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(block_size, "jmidck");
+    let content = vec![0x6D_u8; block_size as usize];
+
+    // Commit, but crash after checkpointing only 1 block (the rest unwritten).
+    {
+        let file_dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let jdev = Arc::new(JournalDevice::new(file_dev.clone(), block_size as usize));
+        let fs = Ext4::open(jdev.clone());
+        let journal = Journal::load(&fs).expect("load").expect("journal");
+        jdev.begin(journal.sb.sequence);
+        let f = fs.create(ROOT_INODE, "mid.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &content).expect("write");
+        let txn = jdev.end().expect("txn");
+        // crash after only 1 of the txn's blocks reached its final location.
+        journal.commit_with_crash(&fs, &txn, CrashPoint::MidCheckpoint(1)).expect("commit-mid");
+    }
+
+    // Recovery replays the whole txn (idempotently re-writing the 1, completing the rest).
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("open_and_recover");
+        let ino = fs.generic_open("/mid.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0).expect("open");
+        let mut buf = vec![0u8; content.len()];
+        let n = fs.read_at(ino, 0, &mut buf).expect("read");
+        assert_eq!(n, content.len());
+        assert_eq!(buf, content, "mid-checkpoint crash recovered fully");
+        let j = Journal::load(&fs).expect("load").expect("journal");
+        assert_eq!(j.sb.start, 0, "journal cleared after recovery");
+    }
+
+    // Running recovery AGAIN must be a harmless no-op (idempotent recovery).
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("second open_and_recover");
+        let j = Journal::load(&fs).expect("load").expect("journal");
+        assert_eq!(j.sb.start, 0, "journal still clean after a second recovery");
+    }
+
+    fsck_clean(&img);
+}
+
+#[test] fn crash_mid_checkpoint_is_idempotent_1k() { crash_mid_checkpoint_is_idempotent(1024); }
+#[test] fn crash_mid_checkpoint_is_idempotent_2k() { crash_mid_checkpoint_is_idempotent(2048); }
+#[test] fn crash_mid_checkpoint_is_idempotent_4k() { crash_mid_checkpoint_is_idempotent(4096); }
+
 #[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);

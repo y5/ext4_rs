@@ -32,7 +32,7 @@ pub use crate::ext4_defs::journal::{
 /// block is durable (steps 1-6), leaving the journal dirty with a committed but
 /// un-checkpointed transaction — exactly what recovery must replay.
 /// `MidCheckpoint(n)` checkpoints only the first `n` blocks then stops (for
-/// idempotency testing in Task 4.3).
+/// checkpoint-idempotency testing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPoint {
     None,
