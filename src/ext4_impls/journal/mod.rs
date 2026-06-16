@@ -18,8 +18,9 @@ pub use device::*;
 // test harness assemble/parse/verify log blocks with these.
 pub use crate::ext4_defs::journal::{
     assemble_descriptor_block, descriptor_block_tag_capacity, finalize_commit_csum,
-    finalize_revoke_csum, jbd2_block_csum, jbd2_csum_seed, jbd2_data_block_csum,
-    parse_descriptor_block, patch_journal_sb_head, verify_commit_csum, verify_revoke_csum,
+    finalize_journal_sb_csum, finalize_revoke_csum, jbd2_block_csum, jbd2_csum_seed,
+    jbd2_data_block_csum, parse_descriptor_block, patch_journal_sb_head, verify_commit_csum,
+    verify_revoke_csum,
     BlockTag, CommitBlock, JournalSuperblock, RevokeBlock, TagFormat, JBD2_COMMIT_BLOCK,
     JBD2_DESCRIPTOR_BLOCK, JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2,
     JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FEATURE_INCOMPAT_REVOKE, JBD2_FLAG_DELETED,
@@ -427,6 +428,12 @@ impl Journal {
         // re-read + patch in place to preserve sb fields the parser doesn't model (s_checksum, etc.); see recover()
         let mut sb_block = self.read_log_block(fs, 0)?;
         patch_journal_sb_head(&mut sb_block, seq, first);
+        // On a CSUM_V2/V3 journal, mutating s_sequence/s_start invalidates the
+        // journal-superblock checksum (@252); recompute it or e2fsck/the kernel
+        // reject the journal sb as corrupt.
+        if has_csum {
+            finalize_journal_sb_csum(&mut sb_block);
+        }
         self.write_log_block(fs, 0, &sb_block)?;
         fs.block_device.flush();
 
@@ -486,6 +493,9 @@ impl Journal {
         // the authoritative on-disk state; the log can be reused.
         let mut sb_block = self.read_log_block(fs, 0)?;
         patch_journal_sb_head(&mut sb_block, seq.wrapping_add(1), 0);
+        if has_csum {
+            finalize_journal_sb_csum(&mut sb_block);
+        }
         self.write_log_block(fs, 0, &sb_block)?;
         fs.block_device.flush();
 
@@ -575,6 +585,13 @@ impl Journal {
         // emit() would zero, corrupting the superblock.
         let mut sb_block = self.read_log_block(fs, 0)?;
         patch_journal_sb_head(&mut sb_block, scan.last_sequence.wrapping_add(1), 0);
+        // CSUM_V2/V3 journals checksum the superblock (@252); recompute it after
+        // patching s_sequence/s_start or the cleared sb reads back corrupt.
+        let has_csum = self.sb.has_incompat(JBD2_FEATURE_INCOMPAT_CSUM_V2)
+            || self.sb.has_incompat(JBD2_FEATURE_INCOMPAT_CSUM_V3);
+        if has_csum {
+            finalize_journal_sb_csum(&mut sb_block);
+        }
         self.write_log_block(fs, 0, &sb_block)?;
         fs.block_device.flush();
 

@@ -1287,6 +1287,112 @@ fn emitted_journal_parses_with_debugfs_logdump_4k() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Task 7.3: forced-CSUM_V3 integration. On this machine mkfs.ext4 lays down a
+// V1 (no-csum) journal; CSUM_V3 only appears once a kernel mounts the fs. We
+// force CSUM_V3 onto a fresh fixture's journal so the REAL commit + recovery +
+// e2fsck loop exercises the journal checksum paths (descriptor tail, commit,
+// revoke, per-tag data csums) end-to-end — coverage the V1 default never hits.
+// ---------------------------------------------------------------------------
+
+/// Force the journal into CSUM_V3 mode by patching its superblock (block 0 of
+/// inode 8): set the CSUM_V3 incompat bit + checksum_type=CRC32C, then recompute
+/// the journal-superblock checksum. After this, our commit emits checksummed
+/// descriptor/commit/revoke blocks and recovery verifies them.
+fn force_journal_csum_v3(fs: &Ext4, j: &Journal) {
+    let mut sb = j.read_log_block(fs, 0).unwrap(); // 1024+ byte block
+                                                   // s_feature_incompat @40 BE: set CSUM_V3 (0x0010)
+    let mut feat = u32::from_be_bytes(sb[40..44].try_into().unwrap());
+    feat |= 0x0010;
+    sb[40..44].copy_from_slice(&feat.to_be_bytes());
+    // s_checksum_type @80 = 4 (CRC32C)
+    sb[80] = 4;
+    // s_checksum @252 BE = crc32c(~0, sb[0..1024] with @252 zeroed, 1024)
+    sb[252..256].copy_from_slice(&[0, 0, 0, 0]);
+    let csum = ext4_rs::ext4_crc32c(ext4_rs::EXT4_CRC32_INIT, &sb[0..1024], 1024);
+    sb[252..256].copy_from_slice(&csum.to_be_bytes()); // BIG-ENDIAN
+    j.write_log_block(fs, 0, &sb).unwrap();
+}
+
+#[test]
+fn csum_v3_commit_and_recover_clean_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") {
+        eprintln!("skip");
+        return;
+    }
+    let img = fresh_image(4096, "jcsumv3");
+    // Enable CSUM_V3 on the journal BEFORE any journaled op.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        let j = Journal::load(&fs).expect("load").expect("journal");
+        force_journal_csum_v3(&fs, &j);
+    }
+    let content = vec![0xC3u8; 4096];
+    // FULL journaled write (commit emits CSUM_V3 descriptor+commit; checkpoints).
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        // sanity: journal really is csum now
+        assert!(Journal::load(&fs)
+            .unwrap()
+            .unwrap()
+            .sb
+            .has_incompat(JBD2_FEATURE_INCOMPAT_CSUM_V3));
+        let f = fs.create(ROOT_INODE, "c.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &content).expect("write");
+    }
+    // Reopen plain, content present, journal clean; e2fsck validates the CSUM_V3 journal.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        let ino = fs
+            .generic_open("/c.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("open");
+        let mut buf = vec![0u8; content.len()];
+        fs.read_at(ino, 0, &mut buf).expect("read");
+        assert_eq!(buf, content);
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn csum_v3_crash_before_checkpoint_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") {
+        eprintln!("skip");
+        return;
+    }
+    let img = fresh_image(4096, "jcsumv3crash");
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        let j = Journal::load(&fs).unwrap().unwrap();
+        force_journal_csum_v3(&fs, &j);
+    }
+    let content = vec![0x3Cu8; 4096];
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "cc.bin", reg_mode()).expect("create");
+        fs.journal_device
+            .as_ref()
+            .unwrap()
+            .set_crash(CrashPoint::AfterCommitBlock);
+        fs.write_at(f.inode_num, 0, &content).expect("write");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover"); // recovery VERIFIES the CSUM_V3 commit block
+        let ino = fs
+            .generic_open("/cc.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("open");
+        let mut buf = vec![0u8; content.len()];
+        fs.read_at(ino, 0, &mut buf).unwrap();
+        assert_eq!(buf, content);
+    }
+    fsck_clean(&img);
+}
+
 #[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);

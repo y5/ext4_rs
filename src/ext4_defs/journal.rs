@@ -232,6 +232,7 @@ impl JournalSuperblock {
 /// would zero.
 pub const JSB_OFF_SEQUENCE: usize = 24; // s_sequence (BE u32): first expected commit id
 pub const JSB_OFF_START: usize = 28;    // s_start (BE u32): log start block; 0 == clean
+pub const JSB_OFF_CHECKSUM: usize = 252; // s_checksum (BE u32): jbd2 superblock csum
 
 /// Patch s_sequence and s_start of a journal superblock block in place (BE),
 /// leaving every other field byte-for-byte untouched.
@@ -239,6 +240,23 @@ pub fn patch_journal_sb_head(sb_block: &mut [u8], sequence: u32, start: u32) {
     debug_assert!(sb_block.len() >= JSB_OFF_START + 4);
     sb_block[JSB_OFF_SEQUENCE..JSB_OFF_SEQUENCE + 4].copy_from_slice(&sequence.to_be_bytes());
     sb_block[JSB_OFF_START..JSB_OFF_START + 4].copy_from_slice(&start.to_be_bytes());
+}
+
+/// Recompute the jbd2 journal-superblock checksum (`s_checksum` @252, BE) in
+/// place, for a CSUM_V2/V3 journal. jbd2 seeds with `~0` (NOT the uuid seed) and
+/// covers the FIRST 1024 bytes of the superblock (`sizeof(journal_superblock_t)`)
+/// with `s_checksum` zeroed — see `jbd2_superblock_csum()`. Call AFTER any in-
+/// place patch (e.g. [`patch_journal_sb_head`]) on a checksummed journal, or the
+/// on-disk superblock checksum goes stale and e2fsck/the kernel reject it.
+pub fn finalize_journal_sb_csum(sb_block: &mut [u8]) {
+    debug_assert!(sb_block.len() >= JBD2_SUPERBLOCK_MIN_LEN);
+    sb_block[JSB_OFF_CHECKSUM..JSB_OFF_CHECKSUM + 4].copy_from_slice(&[0u8; 4]);
+    let c = ext4_crc32c(
+        EXT4_CRC32_INIT,
+        &sb_block[0..JBD2_SUPERBLOCK_MIN_LEN],
+        JBD2_SUPERBLOCK_MIN_LEN as u32,
+    );
+    sb_block[JSB_OFF_CHECKSUM..JSB_OFF_CHECKSUM + 4].copy_from_slice(&c.to_be_bytes());
 }
 
 /// Which on-disk block-tag layout a journal uses, selected by its incompat
