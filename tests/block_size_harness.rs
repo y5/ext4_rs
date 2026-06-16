@@ -2319,13 +2319,60 @@ fn fallocate_alloc_1k() {
 fn fallocate_alloc_4k() {
     fallocate_alloc(4096);
 }
+/// Writing into a preallocated (unwritten) region must convert the written
+/// blocks to initialized so the data reads back, while the untouched part of
+/// the range stays zero (still unwritten). Writing the middle of one unwritten
+/// extent splits it into unwritten head / initialized middle / unwritten tail.
+fn write_after_fallocate(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "falloc_w");
+    let bs = block_size as usize;
+
+    let ino;
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "w.bin", reg_mode()).expect("create");
+        ino = f.inode_num;
+        // Preallocate 4 blocks (one unwritten extent), size = 4*bs.
+        ext4.fuse_fallocate(ino as u64, 0, 0, (4 * bs) as i64, 0).expect("fallocate");
+        // Write real data into the middle block (block 1).
+        ext4.write_at(ino, bs, &vec![0xCDu8; bs]).expect("write mid");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    // Block 1 reads the written data; blocks 0, 2, 3 still read as zeros.
+    let mut b1 = vec![0u8; bs];
+    ext4.read_at(ino, bs, &mut b1).expect("read b1");
+    assert!(b1.iter().all(|&b| b == 0xCD), "written block not initialized @ {block_size}");
+    for blk in [0usize, 2, 3] {
+        let mut z = vec![0xffu8; bs];
+        ext4.read_at(ino, blk * bs, &mut z).expect("read z");
+        assert!(z.iter().all(|&b| b == 0), "block {blk} should still read zero @ {block_size}");
+    }
+    assert_eq!(
+        ext4.get_inode_ref(ino).inode.size(),
+        (4 * bs) as u64,
+        "size changed @ {block_size}"
+    );
+}
+
 #[test]
-#[ignore = "PUNCH_HOLE pending extent_remove_space interior-split fix (Task 5)"]
+fn write_after_fallocate_1k() {
+    write_after_fallocate(1024);
+}
+#[test]
+fn write_after_fallocate_4k() {
+    write_after_fallocate(4096);
+}
+
+#[test]
 fn fallocate_punch_1k() {
     fallocate_punch(1024);
 }
 #[test]
-#[ignore = "PUNCH_HOLE pending extent_remove_space interior-split fix (Task 5)"]
 fn fallocate_punch_4k() {
     fallocate_punch(4096);
 }

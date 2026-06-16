@@ -863,30 +863,59 @@ impl Ext4 {
 
         let depth = search_path.depth as usize;
 
-        /* If we do remove_space inside the range of an extent */
+        /* If we remove_space strictly inside one extent, split it into a head
+         * [ee_block, from) and a tail (to, ee_end], freeing the punched middle.
+         * Both halves keep the original extent's physical run and unwritten
+         * flag. */
         let mut ex = search_path.path[depth].extent.unwrap();
         if ex.get_first_block() < from
             && to < (ex.get_first_block() + ex.get_actual_len() as u32 - 1)
         {
-            let mut newex = Ext4Extent::default();
             let unwritten = ex.is_unwritten();
             let ee_block = ex.first_block;
-            let block_count = ex.block_count;
-            let newblock = to + 1 - ee_block + ex.get_pblock() as u32;
-            // Subtract in u32 then narrow; casting each side to u16 first would
-            // truncate the high bits for logical blocks past 65535.
-            ex.block_count = from.saturating_sub(ee_block) as u16;
+            let ee_end = ee_block + ex.get_actual_len() as u32 - 1; // last logical block
+            let pblock = ex.get_pblock();
 
+            // Free the physical blocks backing the punched range [from, to].
+            self.ext_remove_blocks(inode_ref, &mut ex, from, to);
+
+            // Shrink the original extent in place to the head [ee_block, from).
+            let mut head = Ext4Extent::default();
+            head.first_block = ee_block;
+            head.store_pblock(pblock);
+            head.set_actual_len((from - ee_block) as u16);
             if unwritten {
-                ex.mark_unwritten();
+                head.mark_unwritten();
             }
-            newex.first_block = to + 1;
-            newex.block_count = (ee_block + block_count as u32 - 1 - to) as u16;
-            newex.start_lo = newblock;
-            newex.start_hi = ((newblock as u64) >> 32) as u16;
+            let node = &search_path.path[depth];
+            if node.pblock_of_node == 0 {
+                // Root extent lives in the inode body.
+                *inode_ref.inode.root_extent_mut_at(node.position) = head;
+            } else {
+                // Leaf extent lives in a block (mirror merge_extent's leaf path).
+                let off = size_of::<Ext4ExtentHeader>()
+                    + size_of::<Ext4Extent>() * node.position;
+                let mut blk = Block::load(
+                    &self.block_device,
+                    node.pblock_of_node * self.block_size(),
+                    self.block_size(),
+                );
+                let slot: &mut Ext4Extent = blk.read_offset_as_mut(off);
+                *slot = head;
+                blk.sync_blk_to_disk(&self.block_device);
+            }
 
-            self.insert_extent(inode_ref, &mut newex)?;
+            // Insert the tail (to, ee_end] at the same physical run.
+            let mut tail = Ext4Extent::default();
+            tail.first_block = to + 1;
+            tail.store_pblock(pblock + (to + 1 - ee_block) as u64);
+            tail.set_actual_len((ee_end - to) as u16);
+            if unwritten {
+                tail.mark_unwritten();
+            }
+            self.insert_extent(inode_ref, &mut tail)?;
 
+            self.write_back_inode(inode_ref);
             return Ok(EOK);
         }
 

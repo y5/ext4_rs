@@ -392,6 +392,30 @@ impl Ext4 {
         // Start bgid for block allocation
         let mut start_bgid = 0;
 
+        // Convert any preallocated (unwritten) blocks in the write range to
+        // holes first. They stay unwritten until written: leaving them mapped
+        // would keep the extent unwritten, so the read path would return zeros
+        // instead of the data we are about to write. Punching them (freeing the
+        // reserved blocks) lets the hole-fill below remap them as initialized
+        // blocks that hold the written data; the unwritten parts outside the
+        // write range survive (extent_remove_space splits around them).
+        {
+            let mut lb = iblock_start;
+            while lb < iblock_last {
+                let (_p, unwritten) = self.get_pblock_state(&inode_ref, lb as u32);
+                if !unwritten {
+                    lb += 1;
+                    continue;
+                }
+                let mut run_end = lb + 1;
+                while run_end < iblock_last && self.get_pblock_state(&inode_ref, run_end as u32).1 {
+                    run_end += 1;
+                }
+                self.extent_remove_space(&mut inode_ref, lb as u32, (run_end - 1) as u32)?;
+                lb = run_end;
+            }
+        }
+
         // Ensure every logical block the write touches is mapped to a physical
         // block, allocating any holes. A hole can lie *below* EOF in a sparse
         // file (e.g. a higher logical block was written first), so allocation
