@@ -10,6 +10,7 @@ pub use crate::ext4_defs::BlockDevice;
 pub use crate::ext4_defs::Ext4;
 pub use crate::ext4_defs::InodeFileType;
 pub use crate::ext4_defs::BLOCK_SIZE;
+pub use crate::ext4_defs::{FileLock, F_RDLCK, F_UNLCK, F_WRLCK};
 
 /// fuser interface for ext4
 impl Ext4 {
@@ -776,8 +777,13 @@ impl Ext4 {
     /// is not forced to flush pending writes. One reason to flush data, is if the
     /// filesystem wants to return write errors. If the filesystem supports file locking
     /// operations (setlk, getlk) it should remove all locks belonging to 'lock_owner'.
-    fn fuse_flush(&mut self, ino: u64, fh: u64, lock_owner: u64) {
-        unimplemented!();
+    pub fn fuse_flush(&mut self, _ino: u64, _fh: u64, lock_owner: u64) -> Result<usize> {
+        // Nothing to flush: writes are write-through, so there is no per-fh dirty
+        // buffer to push. We only honor the documented contract of dropping any
+        // POSIX locks held by this owner (the lock table is maintained by
+        // setlk/getlk).
+        self.locks_release_owner(lock_owner);
+        Ok(EOK)
     }
 
     /// Release an open file.
@@ -788,22 +794,31 @@ impl Ext4 {
     /// the release. fh will contain the value set by the open method, or will be undefined
     /// if the open method didn't set any value. flags will contain the same flags as for
     /// open.
-    fn fuse_release(
+    pub fn fuse_release(
         &mut self,
         _ino: u64,
         _fh: u64,
         _flags: i32,
-        _lock_owner: Option<u64>,
+        lock_owner: Option<u64>,
         _flush: bool,
-    ) {
-        unimplemented!();
+    ) -> Result<usize> {
+        // No per-open state to tear down (file I/O is stateless here). Drop any
+        // locks held by the closing owner, as the kernel expects.
+        if let Some(owner) = lock_owner {
+            self.locks_release_owner(owner);
+        }
+        Ok(EOK)
     }
 
     /// Synchronize file contents.
     /// If the datasync parameter is non-zero, then only the user data should be flushed,
     /// not the meta data.
-    fn fuse_fsync(&mut self, ino: u64, fh: u64, datasync: bool) {
-        unimplemented!();
+    pub fn fuse_fsync(&mut self, _ino: u64, _fh: u64, _datasync: bool) -> Result<usize> {
+        // Data and metadata are already written through to the device; force the
+        // device's own buffers to stable storage. We don't separately buffer
+        // metadata, so `datasync` makes no difference here.
+        self.block_device.flush();
+        Ok(EOK)
     }
 
     /// Read directory.
@@ -838,16 +853,27 @@ impl Ext4 {
     /// For every opendir call there will be exactly one releasedir call. fh will
     /// contain the value set by the opendir method, or will be undefined if the
     /// opendir method didn't set any value.
-    fn fuse_releasedir(&mut self, _ino: u64, _fh: u64, _flags: i32) {
-        unimplemented!();
+    pub fn fuse_releasedir(&mut self, _ino: u64, _fh: u64, _flags: i32) -> Result<usize> {
+        // opendir stores no state to release.
+        Ok(EOK)
+    }
+
+    /// Drop every advisory lock held by `owner` across all inodes. Called from
+    /// `flush`/`release` so a closing file descriptor leaves no stale locks.
+    pub(crate) fn locks_release_owner(&mut self, owner: u64) {
+        for locks in self.locks.values_mut() {
+            locks.retain(|l| l.owner != owner);
+        }
+        self.locks.retain(|_, locks| !locks.is_empty());
     }
 
     /// Synchronize directory contents.
     /// If the datasync parameter is set, then only the directory contents should
     /// be flushed, not the meta data. fh will contain the value set by the opendir
     /// method, or will be undefined if the opendir method didn't set any value.
-    fn fuse_fsyncdir(&mut self, ino: u64, fh: u64, datasync: bool) {
-        unimplemented!();
+    pub fn fuse_fsyncdir(&mut self, _ino: u64, _fh: u64, _datasync: bool) -> Result<usize> {
+        self.block_device.flush();
+        Ok(EOK)
     }
 
     /// Set an extended attribute.
@@ -899,17 +925,31 @@ impl Ext4 {
     }
 
     /// Test for a POSIX file lock.
-    fn fuse_getlk(
-        &mut self,
+    ///
+    /// Returns a `FileLock` describing the first lock that *would* conflict with
+    /// the requested `[start, end]` range of type `typ`; if nothing conflicts,
+    /// the returned lock has type `F_UNLCK` (the range is grantable). `end` is
+    /// inclusive, matching the table's convention.
+    pub fn fuse_getlk(
+        &self,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         lock_owner: u64,
         start: u64,
         end: u64,
         typ: i32,
         pid: u32,
-    ) {
-        unimplemented!();
+    ) -> Result<FileLock> {
+        match self.lock_conflict(ino as u32, lock_owner, start, end, typ) {
+            Some(conflict) => Ok(conflict),
+            None => Ok(FileLock {
+                owner: lock_owner,
+                pid,
+                start,
+                end,
+                typ: F_UNLCK,
+            }),
+        }
     }
 
     /// Acquire, modify or release a POSIX file lock.
@@ -919,38 +959,160 @@ impl Ext4 {
     /// used to fill in this field in getlk(). Note: if the locking methods are not
     /// implemented, the kernel will still allow file locking to work locally.
     /// Hence these are only interesting for network filesystems and similar.
-    fn fuse_setlk(
+    ///
+    /// We can't truly block inside this synchronous library, so a blocking
+    /// request (`sleep == true`) that conflicts returns `EAGAIN` just like the
+    /// non-blocking case rather than waiting.
+    pub fn fuse_setlk(
         &mut self,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         lock_owner: u64,
         start: u64,
         end: u64,
         typ: i32,
         pid: u32,
-        sleep: bool,
-    ) {
-        unimplemented!();
+        _sleep: bool,
+    ) -> Result<usize> {
+        let ino = ino as u32;
+
+        if typ == F_UNLCK {
+            self.lock_remove_owner_range(ino, lock_owner, start, end);
+            return Ok(EOK);
+        }
+
+        // A read/write request must not clash with another owner's lock.
+        if self
+            .lock_conflict(ino, lock_owner, start, end, typ)
+            .is_some()
+        {
+            return_errno!(Errno::EAGAIN);
+        }
+
+        // Drop this owner's own overlapping locks (upgrade/replace), then add it.
+        self.lock_remove_owner_range(ino, lock_owner, start, end);
+        self.locks.entry(ino).or_default().push(FileLock {
+            owner: lock_owner,
+            pid,
+            start,
+            end,
+            typ,
+        });
+        Ok(EOK)
+    }
+
+    /// Find a held lock that conflicts with `[start, end]` of type `typ` for
+    /// `owner`: a different owner, an overlapping range, and not both read locks.
+    fn lock_conflict(
+        &self,
+        ino: u32,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+    ) -> Option<FileLock> {
+        let held = self.locks.get(&ino)?;
+        held.iter()
+            .find(|l| {
+                l.owner != owner
+                    && start <= l.end
+                    && l.start <= end
+                    && (typ == F_WRLCK || l.typ == F_WRLCK)
+            })
+            .copied()
+    }
+
+    /// Remove `owner`'s locks overlapping `[start, end]` for `ino`.
+    fn lock_remove_owner_range(&mut self, ino: u32, owner: u64, start: u64, end: u64) {
+        if let Some(held) = self.locks.get_mut(&ino) {
+            held.retain(|l| !(l.owner == owner && start <= l.end && l.start <= end));
+            if held.is_empty() {
+                self.locks.remove(&ino);
+            }
+        }
     }
 
     /// Map block index within file to block index within device.
     /// Note: This makes sense only for block device backed filesystems mounted
     /// with the 'blkdev' option
-    fn fuse_bmap(&mut self, ino: u64, blocksize: u32, idx: u64) {
-        unimplemented!();
+    pub fn fuse_bmap(&self, ino: u64, blocksize: u32, idx: u64) -> Result<u64> {
+        if blocksize == 0 {
+            return_errno!(Errno::EINVAL);
+        }
+        let fs_bs = self.block_size() as u64;
+        let bs = blocksize as u64;
+
+        // `idx` counts the caller's `blocksize` units; translate to a byte
+        // offset and then to the fs logical block that holds it.
+        let byte_off = idx * bs;
+        let lblock = (byte_off / fs_bs) as u32;
+
+        let iref = self.get_inode_ref(ino as u32);
+        let (pblock, _unwritten) = self.get_pblock_state(&iref, lblock);
+        if pblock == 0 {
+            return Ok(0); // hole / unmapped -> 0 by convention
+        }
+
+        // Physical byte offset, reported back in the caller's blocksize units.
+        let phys_byte = pblock * fs_bs + (byte_off % fs_bs);
+        Ok(phys_byte / bs)
     }
 
     /// control device
-    fn fuse_ioctl(
-        &mut self,
+    ///
+    /// Implements the ext4 inode-attribute ioctls a tool like `chattr`/`lsattr`
+    /// or `stat` uses; anything else is rejected with `ENOTTY` (the kernel's
+    /// "inappropriate ioctl for device"). The reply is the little-endian
+    /// out-buffer FUSE hands back to the caller.
+    pub fn fuse_ioctl(
+        &self,
         ino: u64,
-        fh: u64,
-        flags: u32,
+        _fh: u64,
+        _flags: u32,
         cmd: u32,
         in_data: &[u8],
-        out_size: u32,
-    ) {
-        unimplemented!();
+        _out_size: u32,
+    ) -> Result<Vec<u8>> {
+        // _IO numbers for the inode-flag / version ioctls (8-byte argument on
+        // LP64, which is what the kernel and FUSE pass through).
+        const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+        const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+        const FS_IOC_GETVERSION: u32 = 0x8008_7601;
+        // Which i_flags bits a user may see (matches fs/ext4/ext4.h).
+        const EXT4_FL_USER_VISIBLE: u32 = 0x705B_DFFF;
+        // Bits SETFLAGS may change: the chattr-style attribute flags only. We
+        // deliberately exclude on-disk-format flags the kernel also refuses to
+        // toggle here (EXTENTS_FL 0x80000, HUGE_FILE_FL 0x40000, INDEX_FL
+        // 0x1000, INLINE_DATA_FL, …) — clearing EXTENTS_FL on an extent inode
+        // would corrupt it. So they are always preserved.
+        const EXT4_FL_USER_MODIFIABLE: u32 = 0x6003_C0FF;
+
+        match cmd {
+            FS_IOC_GETFLAGS => {
+                let iref = self.get_inode_ref(ino as u32);
+                let visible = iref.inode.flags() & EXT4_FL_USER_VISIBLE;
+                Ok(visible.to_le_bytes().to_vec())
+            }
+            FS_IOC_SETFLAGS => {
+                if in_data.len() < 4 {
+                    return_errno!(Errno::EINVAL);
+                }
+                let want = u32::from_le_bytes(in_data[..4].try_into().unwrap());
+                let mut iref = self.get_inode_ref(ino as u32);
+                // Replace only the user-modifiable bits; leave the rest
+                // (EXTENTS_FL, INLINE_DATA_FL, …) untouched.
+                let merged = (iref.inode.flags() & !EXT4_FL_USER_MODIFIABLE)
+                    | (want & EXT4_FL_USER_MODIFIABLE);
+                iref.inode.set_flags(merged);
+                self.write_back_inode(&mut iref);
+                Ok(Vec::new())
+            }
+            FS_IOC_GETVERSION => {
+                let iref = self.get_inode_ref(ino as u32);
+                Ok(iref.inode.generation().to_le_bytes().to_vec())
+            }
+            _ => return_errno!(Errno::ENOTTY),
+        }
     }
 
     /// Poll for events

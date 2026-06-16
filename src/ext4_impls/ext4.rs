@@ -85,6 +85,7 @@ impl Ext4 {
             block_device,
             super_block,
             system_zone_cache: None,
+            locks: BTreeMap::new(),
         };
         let zones = ext4_tmp.get_system_zone();
 

@@ -105,6 +105,14 @@ impl BlockDevice for Disk {
         let _r = file.seek(std::io::SeekFrom::Start(offset as u64));
         let _r = file.write_all(&data);
     }
+
+    fn flush(&self) {
+        use std::fs::OpenOptions;
+        // Force the image's data + metadata to stable storage (fuse_fsync).
+        if let Ok(file) = OpenOptions::new().read(true).write(true).open("ex4.img") {
+            let _ = file.sync_all();
+        }
+    }
 }
 
 fn test_raw_block_device_write(block_device: Arc<dyn BlockDevice>, size_mb: usize) {

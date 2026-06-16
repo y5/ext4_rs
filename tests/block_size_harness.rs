@@ -2395,7 +2395,7 @@ fn copy_file_range_basic(block_size: u32) {
     let dst2;
     let dst3;
     {
-        let mut ext4 = open_fs(&img);
+        let ext4 = open_fs(&img);
         let s = ext4.create(ROOT_INODE, "src.bin", reg_mode()).expect("create src");
         src = s.inode_num;
         ext4.write_at(src, 0, &src_data).expect("write src");
@@ -2455,4 +2455,207 @@ fn copy_file_range_basic_1k() {
 #[test]
 fn copy_file_range_basic_4k() {
     copy_file_range_basic(4096);
+}
+
+// ===========================================================================
+// FUSE stub implementations: lifecycle, fsync, bmap, ioctl, locks
+// ===========================================================================
+
+/// A block device wrapper that counts flush() calls, to prove fsync forces a
+/// device flush rather than relying on write-through alone.
+struct CountingDevice {
+    inner: FileBlockDevice,
+    flushes: Arc<core::sync::atomic::AtomicUsize>,
+}
+
+impl BlockDevice for CountingDevice {
+    fn read_offset(&self, offset: usize, len: usize) -> Vec<u8> {
+        self.inner.read_offset(offset, len)
+    }
+    fn write_offset(&self, offset: usize, data: &[u8]) {
+        self.inner.write_offset(offset, data)
+    }
+    fn flush(&self) {
+        self.flushes.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn lifecycle_ops_are_ok_noops() {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(4096, "lifecycle");
+    let mut ext4 = open_fs(&img);
+    let f = ext4.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+    let ino = f.inode_num as u64;
+
+    // None of these panic, and each reports success for this write-through fs.
+    assert_eq!(ext4.fuse_flush(ino, 0, 0).expect("flush"), 0);
+    assert_eq!(
+        ext4.fuse_release(ino, 0, 0, None, false).expect("release"),
+        0
+    );
+    assert_eq!(
+        ext4.fuse_releasedir(ROOT_INODE as u64, 0, 0)
+            .expect("releasedir"),
+        0
+    );
+}
+
+#[test]
+fn fsync_flushes_the_device() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(4096, "fsync");
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let dev: Arc<dyn BlockDevice> = Arc::new(CountingDevice {
+        inner: FileBlockDevice::new(&img),
+        flushes: flushes.clone(),
+    });
+    let mut ext4 = Ext4::open(dev);
+    let f = ext4.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+    ext4.write_at(f.inode_num, 0, &payload(8192)).expect("write");
+
+    ext4.fuse_fsync(f.inode_num as u64, 0, false).expect("fsync");
+    assert!(flushes.load(Ordering::SeqCst) >= 1, "fsync did not flush");
+
+    ext4.fuse_fsyncdir(ROOT_INODE as u64, 0, false)
+        .expect("fsyncdir");
+    assert!(
+        flushes.load(Ordering::SeqCst) >= 2,
+        "fsyncdir did not flush"
+    );
+}
+
+#[test]
+fn bmap_maps_logical_to_physical() {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(4096, "bmap");
+    let ext4 = open_fs(&img);
+    let f = ext4.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+    let ino32 = f.inode_num;
+    // Three full 4 KiB blocks, contiguous.
+    ext4.write_at(ino32, 0, &payload(4096 * 3)).expect("write");
+    let ino = ino32 as u64;
+
+    let iref = ext4.get_inode_ref(ino32);
+    // At blocksize == fs block size, bmap returns the physical fs block directly.
+    for lblk in 0..3u64 {
+        let expected = ext4.get_pblock_idx(&iref, lblk as u32).expect("pblock");
+        assert_eq!(ext4.fuse_bmap(ino, 4096, lblk).expect("bmap"), expected);
+    }
+
+    // A logical block past EOF is a hole -> 0.
+    assert_eq!(ext4.fuse_bmap(ino, 4096, 1000).expect("bmap hole"), 0);
+
+    // Caller blocksize finer than the fs block: idx counts 2 KiB units, so
+    // idx=2 addresses fs logical block 1, and the result is in 2 KiB units too.
+    let phys_lb1 = ext4.get_pblock_idx(&iref, 1).expect("pblock");
+    assert_eq!(ext4.fuse_bmap(ino, 2048, 2).expect("bmap scaled"), phys_lb1 * 2);
+}
+
+#[test]
+fn ioctl_flags_and_version() {
+    const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+    const FS_IOC_GETVERSION: u32 = 0x8008_7601;
+    const FS_NOATIME_FL: u32 = 0x0000_0080;
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(4096, "ioctl");
+    let le = |v: &[u8]| u32::from_le_bytes(v[..4].try_into().unwrap());
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+        let ino = f.inode_num as u64;
+
+        // NOATIME starts clear.
+        let out = ext4
+            .fuse_ioctl(ino, 0, 0, FS_IOC_GETFLAGS, &[], 4)
+            .expect("getflags");
+        assert_eq!(le(&out) & FS_NOATIME_FL, 0);
+
+        // Set it, and read it back within the session.
+        ext4.fuse_ioctl(ino, 0, 0, FS_IOC_SETFLAGS, &FS_NOATIME_FL.to_le_bytes(), 0)
+            .expect("setflags");
+        let out2 = ext4
+            .fuse_ioctl(ino, 0, 0, FS_IOC_GETFLAGS, &[], 4)
+            .expect("getflags2");
+        assert_eq!(le(&out2) & FS_NOATIME_FL, FS_NOATIME_FL);
+
+        // GETVERSION returns the inode generation.
+        let ver = ext4
+            .fuse_ioctl(ino, 0, 0, FS_IOC_GETVERSION, &[], 4)
+            .expect("getversion");
+        assert_eq!(le(&ver), ext4.get_inode_ref(f.inode_num).inode.generation());
+
+        // Unknown command -> ENOTTY.
+        let err = ext4.fuse_ioctl(ino, 0, 0, 0xDEAD_BEEF, &[], 0).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOTTY);
+    }
+
+    // The flag change persisted to a consistent on-disk inode.
+    fsck_clean(&img);
+    let ext4 = open_fs(&img);
+    let ino = ext4
+        .generic_open("/f.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("reopen");
+    let out = ext4
+        .fuse_ioctl(ino as u64, 0, 0, FS_IOC_GETFLAGS, &[], 4)
+        .expect("getflags after reopen");
+    assert_eq!(le(&out) & FS_NOATIME_FL, FS_NOATIME_FL);
+}
+
+#[test]
+fn posix_locks_conflict_and_release() {
+    use ext4_rs::{F_RDLCK, F_UNLCK, F_WRLCK};
+    if !tooling_ready() {
+        return;
+    }
+    const A: u64 = 0xAAAA;
+    const B: u64 = 0xBBBB;
+    const C: u64 = 0xCCCC;
+
+    let img = fresh_image(4096, "locks");
+    let mut ext4 = open_fs(&img);
+    let f = ext4.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+    let ino = f.inode_num as u64;
+
+    // No locks yet: a probe reports F_UNLCK.
+    assert_eq!(ext4.fuse_getlk(ino, 0, B, 0, 100, F_WRLCK, 2).unwrap().typ, F_UNLCK);
+
+    // A takes a write lock on [0, 100].
+    ext4.fuse_setlk(ino, 0, A, 0, 100, F_WRLCK, 1, false).expect("A wrlock");
+
+    // B's probe over [50, 150] reports A's conflicting write lock.
+    let c = ext4.fuse_getlk(ino, 0, B, 50, 150, F_WRLCK, 2).unwrap();
+    assert_eq!((c.typ, c.pid, c.start, c.end), (F_WRLCK, 1, 0, 100));
+
+    // B trying to acquire the conflicting range fails with EAGAIN.
+    let e = ext4.fuse_setlk(ino, 0, B, 50, 150, F_WRLCK, 2, false).unwrap_err();
+    assert_eq!(e.error(), Errno::EAGAIN);
+
+    // Read locks from different owners coexist.
+    ext4.fuse_setlk(ino, 0, A, 200, 300, F_RDLCK, 1, false).expect("A rdlock");
+    ext4.fuse_setlk(ino, 0, B, 250, 350, F_RDLCK, 2, false).expect("B rdlock");
+    assert_eq!(ext4.fuse_getlk(ino, 0, C, 250, 260, F_RDLCK, 3).unwrap().typ, F_UNLCK);
+    // ...but a write probe over the read-locked region conflicts.
+    assert_eq!(ext4.fuse_getlk(ino, 0, C, 250, 260, F_WRLCK, 3).unwrap().typ, F_RDLCK);
+
+    // A releases its write lock; B can now take [0, 100].
+    ext4.fuse_setlk(ino, 0, A, 0, 100, F_UNLCK, 1, false).expect("A unlock");
+    ext4.fuse_setlk(ino, 0, B, 0, 100, F_WRLCK, 2, false).expect("B wrlock");
+
+    // flush by A drops A's remaining locks (its read lock on [200, 300]); only
+    // B's read lock [250, 350] survives in that region.
+    ext4.fuse_flush(ino, 0, A).expect("flush A");
+    let after = ext4.fuse_getlk(ino, 0, C, 200, 300, F_WRLCK, 3).unwrap();
+    assert_eq!((after.typ, after.owner), (F_RDLCK, B));
 }

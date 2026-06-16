@@ -5,6 +5,12 @@ pub trait BlockDevice: Send + Sync + Any {
     /// tolerate short reads at end-of-device (zero-fill the remainder).
     fn read_offset(&self, offset: usize, len: usize) -> Vec<u8>;
     fn write_offset(&self, offset: usize, data: &[u8]);
+
+    /// Force any buffered writes to stable storage. The default is a no-op for
+    /// devices that write through synchronously; file-backed devices override
+    /// this to `fsync(2)` the underlying file. Called by `fuse_fsync` /
+    /// `fuse_fsyncdir`.
+    fn flush(&self) {}
 }
 
 pub struct Block {
