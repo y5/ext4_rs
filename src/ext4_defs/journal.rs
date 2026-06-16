@@ -367,6 +367,65 @@ impl BlockTag {
     }
 }
 
+/// A jbd2 commit block (`struct commit_header`), big-endian on disk.
+///
+/// A commit block terminates a transaction in the log. On-disk layout:
+///   0..12  journal_header_t (h_magic, h_blocktype=`JBD2_COMMIT_BLOCK`, h_sequence)
+///   12     h_chksum_type  (u8)
+///   13     h_chksum_size  (u8)
+///   14..16 h_padding[2]
+///   16..48 h_chksum[8]    (8×u32) — the block checksum for CSUM_V2/V3 lives in
+///          h_chksum[0]@16; left ZERO here (checksums are a later task).
+///   48..56 h_commit_sec   (u64 BE)
+///   56..60 h_commit_nsec  (u32 BE)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitBlock {
+    /// h_sequence — the transaction's commit ID.
+    pub sequence: u32,
+    /// h_commit_sec — commit timestamp, whole seconds.
+    pub commit_sec: u64,
+    /// h_commit_nsec — commit timestamp, nanosecond fraction.
+    pub commit_nsec: u32,
+}
+
+impl CommitBlock {
+    /// Encode this commit block into a fresh, zeroed `block_size`-byte block
+    /// (big-endian). The checksum region (`h_chksum`) is left zero — a later
+    /// task computes it.
+    pub fn emit(&self, block_size: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; block_size];
+        put_be32(&mut buf, 0, JBD2_MAGIC_NUMBER); // h_magic
+        put_be32(&mut buf, 4, JBD2_COMMIT_BLOCK); // h_blocktype
+        put_be32(&mut buf, 8, self.sequence); // h_sequence
+        // h_chksum_type / h_chksum_size / h_padding / h_chksum[8] left zero.
+        put_be64(&mut buf, 48, self.commit_sec); // h_commit_sec
+        put_be32(&mut buf, 56, self.commit_nsec); // h_commit_nsec
+        buf
+    }
+
+    /// Decode a commit block from a raw block buffer (big-endian).
+    ///
+    /// Returns `Errno::EINVAL` if the buffer is too short, the magic is wrong, or
+    /// the blocktype is not `JBD2_COMMIT_BLOCK`.
+    pub fn parse(buf: &[u8]) -> Result<Self> {
+        // Need through h_commit_nsec@56..60.
+        if buf.len() < 60 {
+            return_errno_with_message!(Errno::EINVAL, "journal commit block buffer too short");
+        }
+        if be32(buf, 0) != JBD2_MAGIC_NUMBER {
+            return_errno_with_message!(Errno::EINVAL, "bad jbd2 commit block magic");
+        }
+        if be32(buf, 4) != JBD2_COMMIT_BLOCK {
+            return_errno_with_message!(Errno::EINVAL, "journal block is not a commit block");
+        }
+        Ok(CommitBlock {
+            sequence: be32(buf, 8),
+            commit_sec: be64(buf, 48),
+            commit_nsec: be32(buf, 56),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +555,36 @@ mod tests {
         let (parsed, consumed) = BlockTag::parse(&bytes, TagFormat::V1, false).unwrap();
         assert_eq!(parsed, tag);
         assert_eq!(consumed, 8 + 16);
+    }
+
+    #[test]
+    fn commit_block_roundtrip() {
+        let cb = CommitBlock {
+            sequence: 5,
+            commit_sec: 0x1122334455,
+            commit_nsec: 0x6677,
+        };
+        let bytes = cb.emit(1024);
+        assert_eq!(bytes.len(), 1024);
+        // header magic + blocktype land big-endian at 0 / 4.
+        assert_eq!(&bytes[0..4], &JBD2_MAGIC_NUMBER.to_be_bytes());
+        assert_eq!(&bytes[4..8], &JBD2_COMMIT_BLOCK.to_be_bytes());
+
+        let parsed = CommitBlock::parse(&bytes).unwrap();
+        assert_eq!(parsed, cb);
+    }
+
+    #[test]
+    fn commit_block_rejects_wrong_blocktype() {
+        let cb = CommitBlock {
+            sequence: 1,
+            commit_sec: 0,
+            commit_nsec: 0,
+        };
+        let mut bytes = cb.emit(1024);
+        // Overwrite h_blocktype@4 with a non-commit blocktype.
+        bytes[4..8].copy_from_slice(&JBD2_REVOKE_BLOCK.to_be_bytes());
+        assert!(CommitBlock::parse(&bytes).is_err());
     }
 
     #[test]
