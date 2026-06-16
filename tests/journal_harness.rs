@@ -1188,6 +1188,105 @@ fn journaled_setxattr_crash_recovers_4k() {
     fsck_clean(&img);
 }
 
+/// Cross-check our crate-emitted jbd2 journal against external e2fsprogs tooling.
+///
+/// We emit a real dirty journal (a journaled write that crashes before
+/// checkpoint, leaving a committed-but-uncheckpointed transaction on the log),
+/// then prove two independent third-party parsers accept it:
+///   1. `debugfs -R "logdump -a"` parses and dumps the transaction (descriptor,
+///      the journaled FS block numbers, and the matching commit block).
+///   2. `e2fsck -fy` on a COPY of the image replays our journal ("recovering
+///      journal") and a follow-up `e2fsck -fn` reports the result clean — i.e.
+///      e2fsprogs' own recovery code, not just ours, accepts the journal.
+///
+/// Observed debugfs output (jbd2 V1, no csums — stock mkfs.ext4 journal):
+///   Journal starts at block 1, transaction 2
+///   Found expected sequence 2, type 1 (descriptor block) at block 1
+///   Dumping descriptor block, sequence 2, at block 1:
+///     FS block 0 logged at journal block 2 (flags 0x0)
+///     ...
+///   Found expected sequence 2, type 2 (commit block) at block 7
+#[test]
+fn emitted_journal_parses_with_debugfs_logdump_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("debugfs") || tool_missing("e2fsck") {
+        eprintln!("skip");
+        return;
+    }
+    let img = fresh_image(4096, "jlogdump");
+    // Emit a real journal: journaled write, crash before checkpoint → dirty journal
+    // holding a committed transaction.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "ld.bin", reg_mode()).expect("create");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.write_at(f.inode_num, 0, &vec![0x5Au8; 4096]).expect("write");
+    }
+
+    // 1) debugfs logdump must PARSE our journal and show the transaction.
+    let out = Command::new("debugfs")
+        .args(["-R", "logdump -a", img.to_str().unwrap()])
+        .output()
+        .expect("debugfs spawn");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Robust markers proving debugfs walked a real transaction off our log:
+    //  - it located the journal start + a transaction sequence,
+    //  - it parsed our descriptor block and the journaled FS blocks it tags,
+    //  - it parsed the matching commit block that closes the transaction.
+    assert!(
+        text.contains("Journal starts at block"),
+        "debugfs did not find a dirty journal:\n{text}"
+    );
+    assert!(
+        text.contains("(descriptor block)"),
+        "debugfs did not parse our descriptor block:\n{text}"
+    );
+    assert!(
+        text.contains("logged at journal block"),
+        "debugfs did not map any FS block from our descriptor:\n{text}"
+    );
+    assert!(
+        text.contains("(commit block)"),
+        "debugfs did not parse our commit block:\n{text}"
+    );
+
+    // 2) e2fsprogs RECOVERY cross-check: replay our journal on a COPY (e2fsck -fy
+    //    mutates the image), then confirm a follow-up check is clean. This proves
+    //    e2fsprogs' journal-recovery code accepts our emitted journal.
+    let copy = img.with_extension("recover.img");
+    fs::copy(&img, &copy).expect("copy image");
+    let replay = Command::new("e2fsck")
+        .args(["-fy"])
+        .arg(&copy)
+        .output()
+        .expect("e2fsck spawn");
+    let replay_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        replay_text.contains("recovering journal"),
+        "e2fsck did not recover our journal:\n{replay_text}"
+    );
+    // A second pass must be clean (journal cleared, fs consistent).
+    let recheck = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(&copy)
+        .output()
+        .expect("e2fsck recheck spawn");
+    assert!(
+        recheck.status.success(),
+        "e2fsck -fn not clean after replay:\n{}{}",
+        String::from_utf8_lossy(&recheck.stdout),
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}
+
 #[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);
