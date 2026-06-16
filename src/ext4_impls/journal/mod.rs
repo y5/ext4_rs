@@ -5,6 +5,7 @@
 
 use crate::prelude::*;
 use crate::ext4_defs::*;
+use crate::return_errno_with_message;
 
 /// The in-memory journal engine, anchored on the on-disk jbd2 superblock and
 /// the inode that backs the journal file (inode 8).
@@ -41,5 +42,24 @@ impl Journal {
     /// Map a journal-file logical block index to its physical fs block.
     pub fn map_log_block(&self, fs: &Ext4, log_block: Ext4Lblk) -> Result<Ext4Fsblk> {
         fs.get_pblock_idx(&self.inode_ref, log_block)
+    }
+
+    /// Read one journal-log block by its log-file block index.
+    pub fn read_log_block(&self, fs: &Ext4, idx: Ext4Lblk) -> Result<Vec<u8>> {
+        let pblock = self.map_log_block(fs, idx)?;
+        let bs = fs.block_size();
+        Ok(fs.block_device.read_offset(pblock as usize * bs, bs))
+    }
+
+    /// Write one journal-log block by its log-file block index.
+    pub fn write_log_block(&self, fs: &Ext4, idx: Ext4Lblk, data: &[u8]) -> Result<()> {
+        let pblock = self.map_log_block(fs, idx)?;
+        let bs = fs.block_size();
+        // data must be exactly one block; guard rather than silently truncate/pad.
+        if data.len() != bs {
+            return_errno_with_message!(Errno::EINVAL, "write_log_block: data not one block");
+        }
+        fs.block_device.write_offset(pblock as usize * bs, data);
+        Ok(())
     }
 }

@@ -92,3 +92,28 @@ fn journal_loads_clean_superblock_4k() {
     assert!(j.sb.maxlen > 0);
     assert_eq!(j.sb.start, 0); // freshly mkfs'd journal is clean
 }
+
+#[test]
+fn journal_log_block_read_write_roundtrip_4k() {
+    if tool_missing("mkfs.ext4") {
+        eprintln!("skip: mkfs.ext4 missing");
+        return;
+    }
+    let img = fresh_image(4096, "jlogrw");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load ok").expect("journal present");
+
+    // Write a recognizable pattern into log block index 5, read it back.
+    let bs = fs.block_size();
+    let mut data = vec![0u8; bs];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = ((i * 7 + 3) % 251) as u8;
+    }
+    j.write_log_block(&fs, 5, &data).expect("write ok");
+    let back = j.read_log_block(&fs, 5).expect("read ok");
+    assert_eq!(back, data);
+
+    // Wrong-size write is rejected.
+    assert!(j.write_log_block(&fs, 5, &vec![0u8; bs - 1]).is_err());
+}
