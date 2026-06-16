@@ -253,4 +253,44 @@ impl Journal {
         }
         Ok(table)
     }
+
+    /// Recover a dirty journal: replay all committed transactions to their final
+    /// on-disk locations (honoring revokes and the ESCAPE flag), then clear the
+    /// journal so the next mount sees it clean. Idempotent: a second call after a
+    /// successful recovery is a no-op (the journal is already clear → scan empty).
+    pub fn recover(&self, fs: &Ext4) -> Result<()> {
+        let scan = self.scan(fs)?;
+        if scan.txns.is_empty() {
+            return Ok(()); // clean journal, nothing to replay
+        }
+        let revokes = self.build_revoke_table(fs, &scan)?;
+        let bs = fs.block_size();
+        for txn in &scan.txns {
+            for lb in &txn.blocks {
+                // Skip a block revoked by this-or-a-later transaction.
+                if let Some(&rseq) = revokes.get(&lb.final_block) {
+                    if rseq >= txn.sequence {
+                        continue;
+                    }
+                }
+                let mut data = self.read_log_block(fs, lb.data_log_block as Ext4Lblk)?;
+                // Honor ESCAPE: the logged copy of a block that began with the jbd2
+                // magic has its first 4 bytes zeroed; restore the magic on replay.
+                if lb.flags & JBD2_FLAG_ESCAPE != 0 {
+                    data[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+                }
+                fs.block_device.write_offset(lb.final_block as usize * bs, &data);
+            }
+        }
+        fs.block_device.flush();
+        // Clear the journal: re-read the live superblock block, set s_start=0 and
+        // s_sequence = last_committed + 1, write it back, flush. (put_be32 is
+        // module-private in the codec; patch the 4 BE bytes in place instead.)
+        let mut sb_block = self.read_log_block(fs, 0)?;
+        sb_block[24..28].copy_from_slice(&scan.last_sequence.wrapping_add(1).to_be_bytes()); // s_sequence
+        sb_block[28..32].copy_from_slice(&0u32.to_be_bytes()); // s_start
+        self.write_log_block(fs, 0, &sb_block)?;
+        fs.block_device.flush();
+        Ok(())
+    }
 }

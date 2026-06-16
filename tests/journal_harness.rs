@@ -226,6 +226,48 @@ fn stage_dirty_journal(fs: &Ext4, j: &Journal, txns: &[SynthTxn]) -> u32 {
 }
 
 #[test]
+fn recovery_replays_committed_and_honors_revoke_4k() {
+    if tool_missing("mkfs.ext4") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jreplay");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load").expect("journal");
+    let base = j.sb.sequence;
+    let bs = fs.block_size();
+
+    // Final locations near the image end, safely outside the journal area.
+    let p = 4000u64; // replayed
+    let q = 4001u64; // journaled by A then revoked by B → must NOT be replayed
+    let r = 4002u64; // replayed
+
+    let data_x = vec![0xAB; bs];
+    let data_q = vec![0xC5; bs]; // the "stale" content that must NOT land at q
+    let data_r = vec![0x7E; bs];
+    let txns = vec![
+        SynthTxn { sequence: base,   blocks: vec![(p, data_x.clone()), (q, data_q.clone())], revokes: vec![] },
+        SynthTxn { sequence: base+1, blocks: vec![(r, data_r.clone())], revokes: vec![q] },
+    ];
+    stage_dirty_journal(&fs, &j, &txns);
+
+    j.recover(&fs).expect("recover ok");
+
+    // p and r were replayed to their final locations.
+    assert_eq!(fs.block_device.read_offset(p as usize * bs, bs), data_x);
+    assert_eq!(fs.block_device.read_offset(r as usize * bs, bs), data_r);
+    // q was revoked at a >= sequence, so the stale data_q must NOT be there.
+    assert_ne!(fs.block_device.read_offset(q as usize * bs, bs), data_q);
+
+    // Journal cleared: s_start (BE @28) == 0.
+    let sb_block = j.read_log_block(&fs, 0).unwrap();
+    assert_eq!(u32::from_be_bytes(sb_block[28..32].try_into().unwrap()), 0);
+
+    // Idempotent: a second recover is a no-op and leaves the journal clear.
+    j.recover(&fs).expect("second recover ok");
+    let sb2 = j.read_log_block(&fs, 0).unwrap();
+    assert_eq!(u32::from_be_bytes(sb2[28..32].try_into().unwrap()), 0);
+}
+
+#[test]
 fn recovery_scan_finds_last_commit_4k() {
     if tool_missing("mkfs.ext4") {
         eprintln!("skip: mkfs.ext4 missing");
