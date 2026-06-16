@@ -12,9 +12,9 @@ use std::sync::Arc;
 use ext4_rs::{
     assemble_descriptor_block, finalize_commit_csum, finalize_revoke_csum, jbd2_csum_seed,
     jbd2_data_block_csum, parse_descriptor_block, patch_journal_sb_head, verify_commit_csum,
-    BlockDevice, BlockTag, CommitBlock, Ext4, InodeFileType, Journal, RevokeBlock, TagFormat,
-    JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3,
-    JBD2_FLAG_LAST_TAG,
+    BlockDevice, BlockTag, CommitBlock, Ext4, InodeFileType, Journal, JournalDevice, RevokeBlock,
+    TagFormat, JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2,
+    JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FLAG_LAST_TAG,
 };
 
 const ROOT_INODE: u32 = 2;
@@ -491,6 +491,45 @@ fn recovering_open_clean_image_is_fsck_clean_4k() {
     let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
     let _fs = Ext4::open_and_recover(dev).expect("open_and_recover");
     fsck_clean(&img); // clean journal → recovery is a no-op → image still consistent
+}
+
+#[test]
+fn commit_writes_and_checkpoints_clean_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jcommit");
+    let content = {
+        // Build a JournalDevice-wrapped fs, capture a file-create+write in a txn, commit it.
+        let file_dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let jdev = Arc::new(JournalDevice::new(file_dev.clone(), 4096));
+        let fs = Ext4::open(jdev.clone());
+        let journal = Journal::load(&fs).expect("load").expect("journal");
+        let content = vec![0x5A_u8; 4096];
+
+        jdev.begin(journal.sb.sequence);
+        let f = fs.create(ROOT_INODE, "j.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &content).expect("write");
+        let txn = jdev.end().expect("txn");
+        assert!(!txn.is_empty());
+        journal.commit(&fs, &txn).expect("commit");
+        content
+    };
+
+    // 1) Reopen WITHOUT the journal wrapper; the checkpointed file is on disk.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        let ino = fs.generic_open("/j.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0).expect("open");
+        let mut buf = vec![0u8; content.len()];
+        let n = fs.read_at(ino, 0, &mut buf).expect("read");
+        assert_eq!(n, content.len());
+        assert_eq!(buf, content, "checkpointed file content present");
+        // journal is clean: s_start == 0.
+        let j = Journal::load(&fs).expect("load").expect("journal");
+        assert_eq!(j.sb.start, 0, "journal clean after commit+checkpoint");
+    }
+
+    // 2) e2fsck clean — the journaled+checkpointed create is a consistent change.
+    fsck_clean(&img);
 }
 
 #[test]

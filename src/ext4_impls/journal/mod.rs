@@ -223,6 +223,157 @@ impl Journal {
         Ok(ScanResult { txns, last_sequence })
     }
 
+    /// Commit a transaction: write it to the journal log, then checkpoint it to the
+    /// blocks' final on-disk locations, leaving the journal clean. Crash-safe
+    /// ordering (see comments). No-op for an empty transaction.
+    ///
+    /// LIMITATION: this assumes every block tag fits in ONE descriptor block.
+    /// Multi-descriptor transactions are a future enhancement; typical metadata
+    /// transactions are small. If the tags would overflow one block, commit
+    /// returns `ENOSPC` rather than silently corrupting the log.
+    pub fn commit(&self, fs: &Ext4, txn: &Transaction) -> Result<()> {
+        // 1. Empty transaction → nothing to do.
+        if txn.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Re-read the LIVE on-disk superblock (log block 0) and derive the
+        // feature flags / csum seed exactly as `scan`/`build_revoke_table` do, so
+        // the log we emit matches what recovery will parse.
+        let sb_buf = self.read_log_block(fs, 0)?;
+        let sb = JournalSuperblock::parse(&sb_buf)?;
+        let fmt = TagFormat::from_features(sb.feature_incompat);
+        let has_64bit = sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+        let has_csum = sb.feature_incompat
+            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+            != 0;
+        let seed = jbd2_csum_seed(&sb.uuid);
+        let bs = fs.block_size();
+        let first = sb.first;
+        let maxlen = sb.maxlen;
+        let seq = txn.sequence;
+
+        // A log cursor that wraps back to `first` once it reaches the end of the
+        // journal area, mirroring the SCAN walk.
+        let mut cursor = first;
+        let mut advance = |c: &mut u32| {
+            *c += 1;
+            if *c >= maxlen {
+                *c = first;
+            }
+        };
+
+        // 3a. Build the descriptor block (single-descriptor limit). For each staged
+        // block (BTreeMap → sorted by final block number) build a tag, handling the
+        // ESCAPE case (logged copy zeroes the leading magic; tag flags ESCAPE).
+        let magic_be = JBD2_MAGIC_NUMBER.to_be_bytes();
+        let mut tags: Vec<BlockTag> = Vec::with_capacity(txn.blocks.len());
+        // Logged copies are the (possibly escaped) block bodies we write to the log.
+        let mut logged_copies: Vec<Vec<u8>> = Vec::with_capacity(txn.blocks.len());
+        for (final_block, staged) in &txn.blocks {
+            let mut flags: u16 = 0;
+            let mut logged = staged.data.clone();
+            if staged.data.len() >= 4 && staged.data[0..4] == magic_be[..] {
+                flags |= JBD2_FLAG_ESCAPE;
+                logged[0..4].copy_from_slice(&[0u8; 4]);
+            }
+            // Per-data-block tag checksum over the LOGGED (post-escape) copy. Only
+            // meaningful under CSUM_V2/V3, but cheap to always compute.
+            let checksum = if has_csum {
+                jbd2_data_block_csum(seed, seq, &logged)
+            } else {
+                0
+            };
+            tags.push(BlockTag {
+                blocknr: *final_block,
+                flags,
+                checksum,
+            });
+            logged_copies.push(logged);
+        }
+
+        // Single-descriptor guard: conservatively bound the tag run. 12-byte header,
+        // up to 16 bytes per tag (V3) + 16-byte UUID after the first tag + 4-byte
+        // tail checksum. If it would exceed one block, bail loudly.
+        if 12 + tags.len() * 16 + 16 + 4 > bs {
+            return_errno_with_message!(
+                Errno::ENOSPC,
+                "txn too large for one descriptor block"
+            );
+        }
+
+        let descriptor =
+            assemble_descriptor_block(seed, seq, bs, fmt, has_64bit, has_csum, &tags);
+        self.write_log_block(fs, cursor, &descriptor)?;
+        advance(&mut cursor);
+
+        // 3b. Data blocks: write each logged (escaped) copy in the SAME order.
+        for logged in &logged_copies {
+            self.write_log_block(fs, cursor, logged)?;
+            advance(&mut cursor);
+        }
+
+        // 3c. Revoke block (only when the txn revokes something).
+        if !txn.revokes.is_empty() {
+            let mut blk = RevokeBlock {
+                sequence: seq,
+                blocks: txn.revokes.iter().copied().collect(),
+            }
+            .emit(bs, has_64bit);
+            if has_csum {
+                finalize_revoke_csum(&mut blk, seed);
+            }
+            self.write_log_block(fs, cursor, &blk)?;
+            advance(&mut cursor);
+        }
+
+        // 4. Make the log body durable BEFORE the commit block.
+        fs.block_device.flush();
+
+        // 5. Mark the log active (s_start=first, s_sequence=seq) and flush, BEFORE
+        // the commit becomes durable. A crash here → recovery scans from `first`,
+        // finds the descriptor but no valid commit → discards the partial txn.
+        // Safe: commit() hasn't returned, so losing this txn is fine.
+        let mut sb_block = self.read_log_block(fs, 0)?;
+        patch_journal_sb_head(&mut sb_block, seq, first);
+        self.write_log_block(fs, 0, &sb_block)?;
+        fs.block_device.flush();
+
+        // 6. Commit block — terminates the transaction in the log. After this flush
+        // the txn is durably committed; a crash now → recovery replays it.
+        let mut commit_blk = CommitBlock {
+            sequence: seq,
+            commit_sec: 0,
+            commit_nsec: 0,
+        }
+        .emit(bs);
+        if has_csum {
+            finalize_commit_csum(&mut commit_blk, seed);
+        }
+        self.write_log_block(fs, cursor, &commit_blk)?;
+        advance(&mut cursor);
+        fs.block_device.flush();
+
+        // 7. Checkpoint: write the ORIGINAL (un-escaped) data to each block's final
+        // on-disk location, then flush so the checkpoint is durable before we mark
+        // the journal clean.
+        for (final_block, staged) in &txn.blocks {
+            fs.block_device
+                .write_offset(*final_block as usize * bs, &staged.data);
+        }
+        fs.block_device.flush();
+
+        // 8. Mark clean: s_start=0, s_sequence=seq+1. The checkpointed data is now
+        // the authoritative on-disk state; the log can be reused.
+        let mut sb_block = self.read_log_block(fs, 0)?;
+        patch_journal_sb_head(&mut sb_block, seq.wrapping_add(1), 0);
+        self.write_log_block(fs, 0, &sb_block)?;
+        fs.block_device.flush();
+
+        // 9. Done.
+        Ok(())
+    }
+
     /// Build the revoke table from a scan: block number → highest sequence that
     /// revoked it. During REPLAY a logged block is skipped when revoke_seq >=
     /// txn_seq. Reads each committed txn's revoke blocks. With a checksummed
