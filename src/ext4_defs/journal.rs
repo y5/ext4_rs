@@ -549,6 +549,158 @@ impl RevokeBlock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Descriptor-block assembly/parse + commit/revoke checksum finalizers.
+//
+// These wrap the per-block codecs above into the whole-block layout jbd2 writes
+// to the log, and are the SAME functions recovery uses to read/verify a log.
+// ---------------------------------------------------------------------------
+
+/// Assemble a complete DESCRIPTOR block (big-endian) into a fresh `block_size`
+/// buffer.
+///
+/// Layout: journal_header_t (magic, DESCRIPTOR, `sequence`) at 0..12, then a run
+/// of block tags from offset 12 — one per logged data block. The FIRST tag has
+/// SAME_UUID clear (so 16 UUID placeholder bytes follow it); every later tag
+/// sets SAME_UUID; the LAST tag additionally sets [`JBD2_FLAG_LAST_TAG`]. When
+/// `has_csum` (CSUM_V2/V3), the last 4 bytes hold the descriptor tail checksum
+/// `t_checksum` (BE) = `jbd2_block_csum(seed, block_with_tail_zeroed)`.
+///
+/// Each input tag's `checksum` field is taken as-is (the caller computes the
+/// per-data-block tag checksum); `assemble_descriptor_block` only fixes up the
+/// SAME_UUID / LAST_TAG flag bits.
+pub fn assemble_descriptor_block(
+    seed: u32,
+    sequence: u32,
+    block_size: usize,
+    fmt: TagFormat,
+    has_64bit: bool,
+    has_csum: bool,
+    tags: &[BlockTag],
+) -> Vec<u8> {
+    let mut block = vec![0u8; block_size];
+    put_be32(&mut block, 0, JBD2_MAGIC_NUMBER); // h_magic
+    put_be32(&mut block, 4, JBD2_DESCRIPTOR_BLOCK); // h_blocktype
+    put_be32(&mut block, 8, sequence); // h_sequence
+
+    let mut off = 12;
+    let last = tags.len().saturating_sub(1);
+    for (idx, tag) in tags.iter().enumerate() {
+        let same_uuid = idx > 0;
+        // Recompute the flag bits this descriptor convention requires, preserving
+        // any caller-supplied bits (e.g. ESCAPE) on the tag itself.
+        let mut flags = tag.flags & !(JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG);
+        if same_uuid {
+            flags |= JBD2_FLAG_SAME_UUID;
+        }
+        if idx == last {
+            flags |= JBD2_FLAG_LAST_TAG;
+        }
+        let emit_tag = BlockTag {
+            blocknr: tag.blocknr,
+            flags,
+            checksum: tag.checksum,
+        };
+        let bytes = emit_tag.emit(fmt, has_64bit, same_uuid);
+        block[off..off + bytes.len()].copy_from_slice(&bytes);
+        off += bytes.len();
+    }
+
+    if has_csum {
+        // Tail checksum over the whole block with the tail field zeroed (it is
+        // already zero here).
+        put_be32(&mut block, block_size - 4, 0);
+        let c = jbd2_block_csum(seed, &block);
+        put_be32(&mut block, block_size - 4, c);
+    }
+
+    block
+}
+
+/// Parse a DESCRIPTOR block (big-endian): validate magic + blocktype, then read
+/// block tags from offset 12 until (and including) the one carrying
+/// [`JBD2_FLAG_LAST_TAG`], honoring each tag's trailing UUID. Returns the tags.
+///
+/// The trailing tail checksum (CSUM_V2/V3) is never read as a tag because we
+/// stop at the LAST_TAG; well-formed blocks always terminate there.
+pub fn parse_descriptor_block(
+    buf: &[u8],
+    fmt: TagFormat,
+    has_64bit: bool,
+) -> Result<Vec<BlockTag>> {
+    if buf.len() < 12 {
+        return_errno_with_message!(Errno::EINVAL, "journal descriptor block buffer too short");
+    }
+    if be32(buf, 0) != JBD2_MAGIC_NUMBER {
+        return_errno_with_message!(Errno::EINVAL, "bad jbd2 descriptor block magic");
+    }
+    if be32(buf, 4) != JBD2_DESCRIPTOR_BLOCK {
+        return_errno_with_message!(Errno::EINVAL, "journal block is not a descriptor block");
+    }
+
+    let mut tags = Vec::new();
+    let mut off = 12;
+    loop {
+        // BlockTag::parse length-guards internally; surface its error if we run
+        // out of room before hitting a LAST_TAG (malformed block).
+        let (tag, consumed) = BlockTag::parse(&buf[off..], fmt, has_64bit)?;
+        let is_last = tag.flags & JBD2_FLAG_LAST_TAG != 0;
+        off += consumed;
+        tags.push(tag);
+        if is_last {
+            break;
+        }
+    }
+
+    Ok(tags)
+}
+
+/// Finalize a commit block's checksum in place (CSUM_V2/V3): sets
+/// `h_chksum_type`=4 (CRC32C) @12 and `h_chksum_size`=4 @13, then writes
+/// `jbd2_block_csum(seed, block_with_h_chksum0_zeroed)` BE into `h_chksum[0]`
+/// (@16..20).
+pub fn finalize_commit_csum(block: &mut [u8], seed: u32) {
+    block[12] = 4; // h_chksum_type = JBD2_CRC32C_CHKSUM
+    block[13] = 4; // h_chksum_size = 4
+    put_be32(block, 16, 0); // h_chksum[0] zeroed before computing
+    let c = jbd2_block_csum(seed, block);
+    put_be32(block, 16, c);
+}
+
+/// Verify a commit block's checksum (CSUM_V2/V3): recompute over the block with
+/// `h_chksum[0]` zeroed and compare to the stored BE value at @16..20.
+pub fn verify_commit_csum(block: &[u8], seed: u32) -> bool {
+    if block.len() < 20 {
+        return false;
+    }
+    let stored = be32(block, 16);
+    let mut tmp = block.to_vec();
+    put_be32(&mut tmp, 16, 0);
+    jbd2_block_csum(seed, &tmp) == stored
+}
+
+/// Finalize a revoke block's tail checksum in place (CSUM_V2/V3): write
+/// `jbd2_block_csum(seed, block_with_tail_zeroed)` BE into the LAST 4 bytes.
+pub fn finalize_revoke_csum(block: &mut [u8], seed: u32) {
+    let n = block.len();
+    put_be32(block, n - 4, 0);
+    let c = jbd2_block_csum(seed, block);
+    put_be32(block, n - 4, c);
+}
+
+/// Verify a revoke block's tail checksum (CSUM_V2/V3): recompute over the block
+/// with the last 4 bytes zeroed and compare to the stored BE value there.
+pub fn verify_revoke_csum(block: &[u8], seed: u32) -> bool {
+    if block.len() < 4 {
+        return false;
+    }
+    let n = block.len();
+    let stored = be32(block, n - 4);
+    let mut tmp = block.to_vec();
+    put_be32(&mut tmp, n - 4, 0);
+    jbd2_block_csum(seed, &tmp) == stored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +951,103 @@ mod tests {
         assert_eq!(jbd2_data_block_csum(seed, seq, &data), expected);
         // sequence is folded in: a different seq yields a different csum for same data
         assert_ne!(jbd2_data_block_csum(seed, seq.wrapping_add(1), &data), expected);
+    }
+
+    // Part A — descriptor block assemble/parse + commit/revoke csum finalizers.
+
+    #[test]
+    fn descriptor_block_roundtrip_v3() {
+        let uuid = [0x33u8; 16];
+        let seed = jbd2_csum_seed(&uuid);
+        let sequence = 7;
+        let block_size = 1024;
+        let tags = vec![
+            BlockTag { blocknr: 100, flags: 0, checksum: 0x1111_1111 },
+            BlockTag { blocknr: 200, flags: 0, checksum: 0x2222_2222 },
+            BlockTag { blocknr: 300, flags: 0, checksum: 0x3333_3333 },
+        ];
+        let block = assemble_descriptor_block(
+            seed, sequence, block_size, TagFormat::V3, true, true, &tags,
+        );
+        assert_eq!(block.len(), block_size);
+        // Header: magic + DESCRIPTOR + sequence, big-endian.
+        assert_eq!(&block[0..4], &JBD2_MAGIC_NUMBER.to_be_bytes());
+        assert_eq!(&block[4..8], &JBD2_DESCRIPTOR_BLOCK.to_be_bytes());
+        assert_eq!(be32(&block, 8), sequence);
+
+        let parsed = parse_descriptor_block(&block, TagFormat::V3, true).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].blocknr, 100);
+        assert_eq!(parsed[1].blocknr, 200);
+        assert_eq!(parsed[2].blocknr, 300);
+        // First tag carries the uuid (SAME_UUID clear); later tags set SAME_UUID.
+        assert_eq!(parsed[0].flags & JBD2_FLAG_SAME_UUID, 0);
+        assert_ne!(parsed[1].flags & JBD2_FLAG_SAME_UUID, 0);
+        // Only the last tag carries LAST_TAG.
+        assert_eq!(parsed[0].flags & JBD2_FLAG_LAST_TAG, 0);
+        assert_eq!(parsed[1].flags & JBD2_FLAG_LAST_TAG, 0);
+        assert_ne!(parsed[2].flags & JBD2_FLAG_LAST_TAG, 0);
+        // Per-data-block checksums survive (V3 keeps the full 32 bits).
+        assert_eq!(parsed[0].checksum, 0x1111_1111);
+        assert_eq!(parsed[2].checksum, 0x3333_3333);
+
+        // Descriptor tail csum verifies: recompute over the block with the tail
+        // zeroed and compare to the stored BE value in the last 4 bytes.
+        let stored = be32(&block, block_size - 4);
+        let mut zeroed = block.clone();
+        put_be32(&mut zeroed, block_size - 4, 0);
+        assert_eq!(stored, jbd2_block_csum(seed, &zeroed));
+    }
+
+    #[test]
+    fn descriptor_block_roundtrip_v1_nocsum() {
+        let uuid = [0u8; 16];
+        let seed = jbd2_csum_seed(&uuid);
+        let block_size = 1024;
+        let tags = vec![
+            BlockTag { blocknr: 11, flags: 0, checksum: 0 },
+            BlockTag { blocknr: 22, flags: 0, checksum: 0 },
+        ];
+        let block = assemble_descriptor_block(
+            seed, 1, block_size, TagFormat::V1, false, false, &tags,
+        );
+        // No tail csum: the last 4 bytes are not a checksum (they stay zero here).
+        assert_eq!(be32(&block, block_size - 4), 0);
+
+        let parsed = parse_descriptor_block(&block, TagFormat::V1, false).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].blocknr, 11);
+        assert_eq!(parsed[1].blocknr, 22);
+        assert_ne!(parsed[1].flags & JBD2_FLAG_LAST_TAG, 0);
+    }
+
+    #[test]
+    fn commit_csum_finalize_verify() {
+        let uuid = [0x77u8; 16];
+        let seed = jbd2_csum_seed(&uuid);
+        let cb = CommitBlock { sequence: 5, commit_sec: 0x1122, commit_nsec: 0x33 };
+        let mut block = cb.emit(1024);
+        finalize_commit_csum(&mut block, seed);
+        // chksum_type=4 (CRC32C) and chksum_size=4 must be set.
+        assert_eq!(block[12], 4);
+        assert_eq!(block[13], 4);
+        assert!(verify_commit_csum(&block, seed));
+        // Corrupt a byte: verify must fail.
+        block[60] ^= 0xFF;
+        assert!(!verify_commit_csum(&block, seed));
+    }
+
+    #[test]
+    fn revoke_csum_finalize_verify() {
+        let uuid = [0x99u8; 16];
+        let seed = jbd2_csum_seed(&uuid);
+        let rb = RevokeBlock { sequence: 4, blocks: vec![1, 2, 3] };
+        let mut block = rb.emit(1024, false);
+        finalize_revoke_csum(&mut block, seed);
+        assert!(verify_revoke_csum(&block, seed));
+        // Corrupt a byte in the entry array: verify must fail.
+        block[20] ^= 0xFF;
+        assert!(!verify_revoke_csum(&block, seed));
     }
 
     #[test]
