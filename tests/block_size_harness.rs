@@ -2376,3 +2376,83 @@ fn fallocate_punch_1k() {
 fn fallocate_punch_4k() {
     fallocate_punch(4096);
 }
+
+// --- copy_file_range ---
+
+/// Copy a byte range between two files: a full copy, an offset sub-range copy,
+/// a past-EOF copy that returns only the available bytes, and rejection of a
+/// nonzero flag.
+fn copy_file_range_basic(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "cfr");
+    let len = 10_000usize;
+    let src_data = payload(len);
+
+    let src;
+    let dst;
+    let dst2;
+    let dst3;
+    {
+        let mut ext4 = open_fs(&img);
+        let s = ext4.create(ROOT_INODE, "src.bin", reg_mode()).expect("create src");
+        src = s.inode_num;
+        ext4.write_at(src, 0, &src_data).expect("write src");
+
+        let d = ext4.create(ROOT_INODE, "dst.bin", reg_mode()).expect("create dst");
+        dst = d.inode_num;
+        let n = ext4
+            .fuse_copy_file_range(src as u64, 0, 0, dst as u64, 0, 0, len as u64, 0)
+            .expect("full copy");
+        assert_eq!(n, len, "full copy count @ {block_size}");
+
+        // Sub-range with differing offsets: src[2000,5000) -> dst2 offset 1000.
+        let d2 = ext4.create(ROOT_INODE, "dst2.bin", reg_mode()).expect("create dst2");
+        dst2 = d2.inode_num;
+        let n = ext4
+            .fuse_copy_file_range(src as u64, 0, 2000, dst2 as u64, 0, 1000, 3000, 0)
+            .expect("sub copy");
+        assert_eq!(n, 3000, "sub copy count @ {block_size}");
+
+        // Past-EOF: ask for more than the source has from offset 7000.
+        let d3 = ext4.create(ROOT_INODE, "dst3.bin", reg_mode()).expect("create dst3");
+        dst3 = d3.inode_num;
+        let n = ext4
+            .fuse_copy_file_range(src as u64, 0, 7000, dst3 as u64, 0, 0, 999_999, 0)
+            .expect("eof copy");
+        assert_eq!(n, len - 7000, "past-EOF copy count @ {block_size}");
+
+        // Nonzero flag rejected.
+        assert_eq!(
+            ext4.fuse_copy_file_range(src as u64, 0, 0, dst as u64, 0, 0, 1, 1)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL,
+            "nonzero flag @ {block_size}"
+        );
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let mut buf = vec![0u8; len];
+    ext4.read_at(dst, 0, &mut buf).expect("read dst");
+    assert_eq!(buf, src_data, "full copy mismatch @ {block_size}");
+
+    let mut sub = vec![0u8; 3000];
+    ext4.read_at(dst2, 1000, &mut sub).expect("read dst2");
+    assert_eq!(sub, src_data[2000..5000], "sub copy mismatch @ {block_size}");
+
+    let mut eofbuf = vec![0u8; len - 7000];
+    ext4.read_at(dst3, 0, &mut eofbuf).expect("read dst3");
+    assert_eq!(eofbuf, src_data[7000..], "past-EOF copy mismatch @ {block_size}");
+}
+
+#[test]
+fn copy_file_range_basic_1k() {
+    copy_file_range_basic(1024);
+}
+#[test]
+fn copy_file_range_basic_4k() {
+    copy_file_range_basic(4096);
+}

@@ -1140,8 +1140,8 @@ impl Ext4 {
     }
 
     /// Copy the specified range from the source inode to the destination inode
-    fn fuse_copy_file_range(
-        &mut self,
+    pub fn fuse_copy_file_range(
+        &self,
         ino_in: u64,
         fh_in: u64,
         offset_in: i64,
@@ -1150,7 +1150,46 @@ impl Ext4 {
         offset_out: i64,
         len: u64,
         flags: u32,
-    ) {
-        unimplemented!();
+    ) -> Result<usize> {
+        if flags != 0 {
+            return_errno_with_message!(Errno::EINVAL, "copy_file_range: no flags supported");
+        }
+        if offset_in < 0 || offset_out < 0 {
+            return_errno_with_message!(Errno::EINVAL, "copy_file_range: negative offset");
+        }
+        // Within one file, the source and destination ranges must not overlap.
+        if ino_in == ino_out {
+            let in_end = offset_in as u64 + len;
+            let out_end = offset_out as u64 + len;
+            if (offset_in as u64) < out_end && (offset_out as u64) < in_end {
+                return_errno_with_message!(Errno::EINVAL, "copy_file_range: overlapping ranges");
+            }
+        }
+
+        let chunk = self.block_size();
+        let mut copied = 0usize;
+        let mut in_off = offset_in as usize;
+        let mut out_off = offset_out as usize;
+        let mut buf = vec![0u8; chunk];
+
+        while copied < len as usize {
+            let want = core::cmp::min(chunk, len as usize - copied);
+            // read_at clamps to the source size, so a short read means EOF.
+            let n = self.read_at(ino_in as u32, in_off, &mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            let written = self.write_at(ino_out as u32, out_off, &buf[..n])?;
+            copied += written;
+            in_off += written;
+            out_off += written;
+            if written < n {
+                // Destination could not take everything (e.g. ENOSPC handled by
+                // a short write); stop rather than spin.
+                break;
+            }
+        }
+
+        Ok(copied)
     }
 }
