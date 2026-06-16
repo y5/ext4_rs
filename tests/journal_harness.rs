@@ -263,6 +263,49 @@ fn recovery_scan_finds_last_commit_4k() {
 }
 
 #[test]
+fn recovery_revoke_table_built_4k() {
+    if tool_missing("mkfs.ext4") {
+        eprintln!("skip: mkfs.ext4 missing");
+        return;
+    }
+    let img = fresh_image(4096, "jrevoke");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load").expect("journal");
+    let base = j.sb.sequence;
+    let txns = vec![
+        SynthTxn { sequence: base,     blocks: vec![(2001, b"x".to_vec())], revokes: vec![777] },
+        SynthTxn { sequence: base + 1, blocks: vec![(2002, b"y".to_vec())], revokes: vec![777, 888] },
+    ];
+    stage_dirty_journal(&fs, &j, &txns);
+    let scan = j.scan(&fs).expect("scan");
+    let table = j.build_revoke_table(&fs, &scan).expect("revoke table");
+    assert_eq!(table.get(&777).copied(), Some(base + 1)); // highest revoking seq wins
+    assert_eq!(table.get(&888).copied(), Some(base + 1));
+    assert_eq!(table.get(&999).copied(), None);
+}
+
+#[test]
+fn recovery_revoke_table_empty_when_no_revokes_4k() {
+    if tool_missing("mkfs.ext4") {
+        eprintln!("skip: mkfs.ext4 missing");
+        return;
+    }
+    let img = fresh_image(4096, "jrevokeempty");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load").expect("journal");
+    let base = j.sb.sequence;
+    let txns = vec![
+        SynthTxn { sequence: base, blocks: vec![(3001, b"z".to_vec())], revokes: vec![] },
+    ];
+    stage_dirty_journal(&fs, &j, &txns);
+    let scan = j.scan(&fs).expect("scan");
+    let table = j.build_revoke_table(&fs, &scan).expect("revoke table");
+    assert!(table.is_empty());
+}
+
+#[test]
 fn recovery_scan_clean_journal_is_empty_4k() {
     if tool_missing("mkfs.ext4") {
         eprintln!("skip: mkfs.ext4 missing");

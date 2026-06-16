@@ -216,4 +216,41 @@ impl Journal {
         };
         Ok(ScanResult { txns, last_sequence })
     }
+
+    /// Build the revoke table from a scan: block number → highest sequence that
+    /// revoked it. During REPLAY a logged block is skipped when revoke_seq >=
+    /// txn_seq. Reads each committed txn's revoke blocks. With a checksummed
+    /// journal, a revoke block failing its checksum ABORTS recovery (Err) —
+    /// dropping a revoke risks clobbering live data, so we fail loud (per design).
+    pub fn build_revoke_table(&self, fs: &Ext4, scan: &ScanResult) -> Result<BTreeMap<u64, u32>> {
+        // Anchor feature flags / seed on the LIVE on-disk superblock, exactly as
+        // `scan` does: re-read log block 0 and derive has_64bit/has_csum/seed.
+        let sb_buf = self.read_log_block(fs, 0)?;
+        let sb = JournalSuperblock::parse(&sb_buf)?;
+        let has_64bit = sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+        let has_csum = sb.feature_incompat
+            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+            != 0;
+        let seed = jbd2_csum_seed(&sb.uuid);
+
+        let mut table: BTreeMap<u64, u32> = BTreeMap::new();
+        for txn in &scan.txns {
+            for &log_idx in &txn.revoke_log_blocks {
+                let block = self.read_log_block(fs, log_idx as Ext4Lblk)?;
+                if has_csum && !verify_revoke_csum(&block, seed) {
+                    return_errno_with_message!(Errno::EIO, "revoke block checksum failed");
+                }
+                let rb = RevokeBlock::parse(&block, has_64bit)?;
+                for b in rb.blocks {
+                    // Keep the highest revoking sequence per block. Inserting the
+                    // first-seen value (rather than 0) is robust for any seq.
+                    table
+                        .entry(b)
+                        .and_modify(|s| *s = (*s).max(rb.sequence))
+                        .or_insert(rb.sequence);
+                }
+            }
+        }
+        Ok(table)
+    }
 }
