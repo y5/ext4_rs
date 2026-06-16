@@ -136,7 +136,7 @@ impl BlockDevice for JournalDevice {
                 };
                 block[intra..intra + n].copy_from_slice(&data[src..src + n]);
 
-                // Default tag = data (false); metadata tagging is Phase 5.
+                // data=journaled: every captured block is journaled; metadata tagging is not used (see StagedBlock::is_metadata)
                 s.txn.as_mut().unwrap().stage(b, block, false);
 
                 pos += n;

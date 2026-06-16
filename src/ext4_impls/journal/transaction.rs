@@ -10,8 +10,12 @@ use crate::prelude::*; // BTreeMap, BTreeSet, Vec
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedBlock {
     pub data: Vec<u8>,
-    /// True if this block is filesystem metadata (vs file data). Drives revoke
-    /// correctness and (later) tag flags; data=journaled journals both.
+    /// True if this block is filesystem metadata (vs file data).
+    ///
+    /// NOTE: in this `data=journaled` engine every block is journaled regardless,
+    /// and jbd2 descriptor tags carry no on-disk metadata flag — so this field is
+    /// currently always `false` and not yet load-bearing. It is retained for a
+    /// possible future `data=ordered` mode (where only metadata would be journaled).
     pub is_metadata: bool,
 }
 

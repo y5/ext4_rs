@@ -684,6 +684,69 @@ fn crash_mid_checkpoint_is_idempotent(block_size: u32) {
 #[test] fn crash_mid_checkpoint_is_idempotent_4k() { crash_mid_checkpoint_is_idempotent(4096); }
 
 #[test]
+fn revoke_recorded_in_txn_is_emitted_and_read_back_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jrevemit");
+    let bs = 4096usize;
+
+    // A block we'll "free" (revoke) during the transaction. Pre-seed a sentinel
+    // at its final location; the revoke must not cause its content to change.
+    let revoked = 3500u64;
+    let sentinel = vec![0xA7u8; bs];
+    {
+        let raw: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        raw.write_offset(revoked as usize * bs, &sentinel);
+    }
+
+    // Capture a real fs change AND record a revoke for `revoked`, then commit
+    // durably but crash before checkpoint so the dirty journal still holds the
+    // committed transaction (including its revoke block).
+    let content = vec![0x51u8; bs];
+    let revoke_seq = {
+        let file_dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let jdev = Arc::new(JournalDevice::new(file_dev.clone(), bs));
+        let fs = Ext4::open(jdev.clone());
+        let journal = Journal::load(&fs).expect("load").expect("journal");
+        let seq = journal.sb.sequence;
+        jdev.begin(seq);
+        let f = fs.create(ROOT_INODE, "rev.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &content).expect("write");
+        jdev.revoke(revoked); // fs "frees" the metadata block `revoked`
+        let txn = jdev.end().expect("txn");
+        assert!(txn.revokes.contains(&revoked));
+        journal.commit_with_crash(&fs, &txn, CrashPoint::AfterCommitBlock).expect("commit");
+        seq
+    };
+
+    // EMIT proven by reading the revoke back via the real recovery scan path:
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev); // plain open (no recovery yet)
+        let journal = Journal::load(&fs).expect("load").expect("journal");
+        let scan = journal.scan(&fs).expect("scan");
+        let table = journal.build_revoke_table(&fs, &scan).expect("revoke table");
+        assert_eq!(table.get(&revoked).copied(), Some(revoke_seq),
+            "commit emitted a revoke block that the scan reads back");
+    }
+
+    // HONOR + consistency: recover the dirty journal; the fs change lands, the
+    // revoked block keeps its sentinel (it was not journaled, just revoked), and
+    // the result is e2fsck-clean.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs.generic_open("/rev.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0).expect("open");
+        let mut buf = vec![0u8; content.len()];
+        fs.read_at(ino, 0, &mut buf).expect("read");
+        assert_eq!(buf, content, "fs change recovered");
+        let raw: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let back = raw.read_offset(revoked as usize * bs, bs);
+        assert_eq!(back, sentinel, "revoked (non-journaled) block keeps its content");
+    }
+    fsck_clean(&img);
+}
+
+#[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);
 }
