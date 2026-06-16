@@ -127,6 +127,26 @@ impl Ext4 {
     /// Returns:
     /// `Vec<Ext4DirEntry>` - list of directory entries
     pub fn dir_get_entries(&self, inode: u32) -> Vec<Ext4DirEntry> {
+        self.dir_entries_with_offset_from(inode, 0)
+            .into_iter()
+            .map(|e| e.entry)
+            .collect()
+    }
+
+    /// Walk a directory's entries starting at the byte-position cookie `start`,
+    /// pairing each used entry with the resume cookie that follows it.
+    ///
+    /// The cookie of an entry is its absolute byte position within the
+    /// directory file (`iblock * block_size + offset_in_block`); `next_offset`
+    /// is the position of the following entry. Entries whose position is below
+    /// `start` are skipped, so a caller can resume an enumeration mid-stream by
+    /// passing the last cookie it saw. Unused slots and the directory tail are
+    /// never emitted.
+    pub fn dir_entries_with_offset_from(
+        &self,
+        inode: u32,
+        start: u64,
+    ) -> Vec<Ext4DirEntryWithOffset> {
         let mut entries = Vec::new();
 
         // load inode
@@ -137,9 +157,11 @@ impl Ext4 {
             return entries;
         }
 
+        let block_size = self.block_size();
+
         // calculate total blocks
         let inode_size = inode_ref.inode.size();
-        let total_blocks = inode_size / self.block_size() as u64;
+        let total_blocks = inode_size / block_size as u64;
 
         // start from the first logical block
         let mut iblock = 0;
@@ -157,19 +179,24 @@ impl Ext4 {
                 let fblock = path.pblock;
 
                 // load physical block
-                let ext4block = Block::load(&self.block_device, fblock as usize * self.block_size(), self.block_size());
+                let ext4block = Block::load(&self.block_device, fblock as usize * block_size, block_size);
                 let mut offset = 0;
 
                 // iterate all entries in a block
-                while offset < self.block_size() - core::mem::size_of::<Ext4DirEntryTail>() {
+                while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
                     let de: Ext4DirEntry = ext4block.read_offset_as(offset);
-                    if !de.unused() {
-                        entries.push(de);
-                    }
+                    // absolute byte position of this entry within the directory
+                    let pos = iblock * block_size as u64 + offset as u64;
                     // guard against a malformed zero-length entry (infinite loop)
                     let de_len = de.entry_len() as usize;
                     if de_len == 0 {
                         break;
+                    }
+                    if !de.unused() && pos >= start {
+                        entries.push(Ext4DirEntryWithOffset {
+                            entry: de,
+                            next_offset: pos + de_len as u64,
+                        });
                     }
                     offset += de_len;
                 }

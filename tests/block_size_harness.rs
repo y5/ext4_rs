@@ -1689,3 +1689,99 @@ fn mknod_special_1k() {
 fn mknod_special_4k() {
     mknod_special(4096);
 }
+
+// --- readdir: stable byte-offset cookies / chunked resumption ---
+
+/// Run a batch of debugfs commands from a request file (one per line).
+fn debugfs_script(img: &Path, commands: &str) {
+    let script = Path::new("target").join("harness").join("ddscript.txt");
+    fs::write(&script, commands).unwrap();
+    let out = Command::new("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .arg(&script)
+        .arg(img)
+        .output()
+        .expect("debugfs -f failed to spawn");
+    assert!(out.status.success(), "debugfs script failed");
+}
+
+/// Enumerate a directory in small chunks, resuming each call from the previous
+/// batch's last cookie (the way a FUSE binding does once its reply buffer
+/// fills). The reassembled listing must equal a single-shot read of the whole
+/// directory: every entry exactly once, in order, with strictly increasing
+/// cookies. This is what the old "cookie == array index" scheme could not
+/// guarantee.
+///
+/// The directory is populated with debugfs (not the crate) so it spans several
+/// directory blocks regardless of block size, isolating the readdir path under
+/// test from the crate's own directory-growth code.
+fn readdir_chunked(block_size: u32) {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image(block_size, "readdir");
+
+    // Enough entries (with longish names) to span several directory blocks at
+    // both 1 KiB and 4 KiB.
+    let n = 300usize;
+    let mut script = String::new();
+    for i in 0..n {
+        script.push_str(&format!("mkdir /entry_{i:04}\n"));
+    }
+    debugfs_script(&img, &script);
+    fsck_clean(&img); // the debugfs-built directory is consistent
+
+    let ext4 = open_fs(&img);
+
+    // Single-shot baseline: names from offset 0.
+    let full = ext4.fuse_readdir(ROOT_INODE as u64, 0, 0).expect("readdir full");
+    let full_names: Vec<String> = full.iter().map(|e| e.entry.get_name()).collect();
+    assert!(
+        full_names.len() >= n + 2,
+        "expected at least {} entries (incl . and ..), got {} @ {block_size}",
+        n + 2,
+        full_names.len()
+    );
+
+    // Chunked: take 7 at a time, resume from the last entry's next_offset.
+    let chunk = 7usize;
+    let mut offset: i64 = 0;
+    let mut got: Vec<String> = Vec::new();
+    let mut last_cookie: u64 = 0;
+    loop {
+        let batch = ext4
+            .fuse_readdir(ROOT_INODE as u64, 0, offset)
+            .expect("readdir chunk");
+        if batch.is_empty() {
+            break;
+        }
+        let take = batch.len().min(chunk);
+        for e in &batch[..take] {
+            got.push(e.entry.get_name());
+            assert!(
+                e.next_offset > last_cookie,
+                "cookies not strictly increasing ({} after {}) @ {block_size}",
+                e.next_offset,
+                last_cookie
+            );
+            last_cookie = e.next_offset;
+        }
+        // Resume after the last entry we consumed.
+        offset = batch[take - 1].next_offset as i64;
+    }
+
+    assert_eq!(
+        got, full_names,
+        "chunked readdir != single-shot @ {block_size}"
+    );
+}
+
+#[test]
+fn readdir_chunked_1k() {
+    readdir_chunked(1024);
+}
+#[test]
+fn readdir_chunked_4k() {
+    readdir_chunked(4096);
+}

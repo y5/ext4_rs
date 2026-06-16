@@ -469,10 +469,15 @@ impl Ext4 {
     /// requested size. Send an empty buffer on end of stream. fh will contain the
     /// value set by the opendir method, or will be undefined if the opendir method
     /// didn't set any value.
-    pub fn fuse_readdir(&self, ino: u64, fh: u64, offset: i64) -> Result<Vec<Ext4DirEntry>> {
-        let mut entries = self.dir_get_entries(ino as u32);
-        entries = entries[offset as usize..].to_vec();
-        Ok(entries)
+    pub fn fuse_readdir(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+    ) -> Result<Vec<Ext4DirEntryWithOffset>> {
+        // `offset` is the opaque resume cookie a previous readdir handed back
+        // (the byte position of the next entry), or 0 to start from the top.
+        Ok(self.dir_entries_with_offset_from(ino as u32, offset as u64))
     }
 
     /// Create and open a file.

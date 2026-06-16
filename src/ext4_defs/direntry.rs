@@ -28,6 +28,19 @@ pub struct Ext4DirEntry {
     pub name: [u8; 255],          // File name
 }
 
+/// A directory entry paired with the stable resume cookie that follows it.
+///
+/// `next_offset` is the byte position of the next entry within the directory
+/// file (`iblock * block_size + offset_in_block`). It is what a FUSE binding
+/// hands back as the `offset` of the next `readdir`, and what it passes to
+/// `ReplyDirectory::add` as this entry's `d_off`. Because positions are stable
+/// across insertions and deletions, resumption is mutation-safe.
+#[derive(Debug, Clone, Copy)]
+pub struct Ext4DirEntryWithOffset {
+    pub entry: Ext4DirEntry,
+    pub next_offset: u64,
+}
+
 /// Internal directory entry structure.
 #[repr(C)]
 #[derive(Clone, Copy)]
