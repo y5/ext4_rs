@@ -8,6 +8,45 @@ use crate::return_errno_with_message;
 
 pub const JBD2_MAGIC_NUMBER: u32 = 0xC03B3998;
 
+/// Length in bytes of a jbd2 UUID field (`s_uuid` / a block-tag's trailing UUID).
+const JBD2_UUID_LEN: usize = 16;
+
+// Big-endian read/write helpers shared by every codec in this module. jbd2 is
+// big-endian on disk; these centralize the byte-swapping so the codecs read
+// uniformly. Callers are responsible for length-guarding before calling.
+fn be16(buf: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([buf[off], buf[off + 1]])
+}
+
+fn be32(buf: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn be64(buf: &[u8], off: usize) -> u64 {
+    u64::from_be_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
+
+fn put_be16(buf: &mut [u8], off: usize, v: u16) {
+    buf[off..off + 2].copy_from_slice(&v.to_be_bytes());
+}
+
+fn put_be32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+fn put_be64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_be_bytes());
+}
+
 // Block types (journal_header_t.h_blocktype)
 pub const JBD2_DESCRIPTOR_BLOCK: u32 = 1;
 pub const JBD2_COMMIT_BLOCK: u32 = 2;
@@ -90,28 +129,24 @@ impl JournalSuperblock {
             return_errno_with_message!(Errno::EINVAL, "journal superblock buffer too short");
         }
 
-        let be32 = |off: usize| -> u32 {
-            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-        };
-
-        let magic = be32(0);
+        let magic = be32(buf, 0);
         if magic != JBD2_MAGIC_NUMBER {
             return_errno_with_message!(Errno::EINVAL, "bad jbd2 journal superblock magic");
         }
 
-        let mut uuid = [0u8; 16];
-        uuid.copy_from_slice(&buf[48..64]);
+        let mut uuid = [0u8; JBD2_UUID_LEN];
+        uuid.copy_from_slice(&buf[48..48 + JBD2_UUID_LEN]);
 
         Ok(JournalSuperblock {
-            blocktype: be32(4),
-            blocksize: be32(12),
-            maxlen: be32(16),
-            first: be32(20),
-            sequence: be32(24),
-            start: be32(28),
-            feature_compat: be32(36),
-            feature_incompat: be32(40),
-            feature_ro_compat: be32(44),
+            blocktype: be32(buf, 4),
+            blocksize: be32(buf, 12),
+            maxlen: be32(buf, 16),
+            first: be32(buf, 20),
+            sequence: be32(buf, 24),
+            start: be32(buf, 28),
+            feature_compat: be32(buf, 36),
+            feature_incompat: be32(buf, 40),
+            feature_ro_compat: be32(buf, 44),
             uuid,
             checksum_type: buf[80],
         })
@@ -128,21 +163,17 @@ impl JournalSuperblock {
         let len = core::cmp::max(self.blocksize as usize, JBD2_SUPERBLOCK_MIN_LEN);
         let mut buf = vec![0u8; len];
 
-        let put32 = |buf: &mut [u8], off: usize, v: u32| {
-            buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
-        };
-
-        put32(&mut buf, 0, JBD2_MAGIC_NUMBER); // h_magic
-        put32(&mut buf, 4, self.blocktype); // h_blocktype
-        put32(&mut buf, 12, self.blocksize); // s_blocksize
-        put32(&mut buf, 16, self.maxlen); // s_maxlen
-        put32(&mut buf, 20, self.first); // s_first
-        put32(&mut buf, 24, self.sequence); // s_sequence
-        put32(&mut buf, 28, self.start); // s_start
-        put32(&mut buf, 36, self.feature_compat); // s_feature_compat
-        put32(&mut buf, 40, self.feature_incompat); // s_feature_incompat
-        put32(&mut buf, 44, self.feature_ro_compat); // s_feature_ro_compat
-        buf[48..64].copy_from_slice(&self.uuid); // s_uuid
+        put_be32(&mut buf, 0, JBD2_MAGIC_NUMBER); // h_magic
+        put_be32(&mut buf, 4, self.blocktype); // h_blocktype
+        put_be32(&mut buf, 12, self.blocksize); // s_blocksize
+        put_be32(&mut buf, 16, self.maxlen); // s_maxlen
+        put_be32(&mut buf, 20, self.first); // s_first
+        put_be32(&mut buf, 24, self.sequence); // s_sequence
+        put_be32(&mut buf, 28, self.start); // s_start
+        put_be32(&mut buf, 36, self.feature_compat); // s_feature_compat
+        put_be32(&mut buf, 40, self.feature_incompat); // s_feature_incompat
+        put_be32(&mut buf, 44, self.feature_ro_compat); // s_feature_ro_compat
+        buf[48..48 + JBD2_UUID_LEN].copy_from_slice(&self.uuid); // s_uuid
         buf[80] = self.checksum_type; // s_checksum_type
 
         buf
@@ -240,6 +271,7 @@ impl BlockTag {
         match fmt {
             TagFormat::V3 => {
                 buf.extend_from_slice(&lo.to_be_bytes()); // t_blocknr      @0
+                // V3 t_flags is 32-bit on disk; only the low bits are defined, so we narrow to u16.
                 buf.extend_from_slice(&(self.flags as u32).to_be_bytes()); // t_flags @4
                 buf.extend_from_slice(&hi.to_be_bytes()); // t_blocknr_high @8 (always)
                 buf.extend_from_slice(&self.checksum.to_be_bytes()); // t_checksum @12
@@ -260,7 +292,7 @@ impl BlockTag {
 
         if !same_uuid {
             // Placeholder UUID; the descriptor-block builder fills the real bytes.
-            buf.extend_from_slice(&[0u8; 16]);
+            buf.extend_from_slice(&[0u8; JBD2_UUID_LEN]);
         }
 
         buf
@@ -274,13 +306,6 @@ impl BlockTag {
     /// for the trailing UUID when one is expected), mirroring
     /// [`JournalSuperblock::parse`]'s length guard so we never index out of range.
     pub fn parse(buf: &[u8], fmt: TagFormat, has_64bit: bool) -> Result<(BlockTag, usize)> {
-        let be32 = |buf: &[u8], off: usize| -> u32 {
-            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-        };
-        let be16 = |buf: &[u8], off: usize| -> u16 {
-            u16::from_be_bytes([buf[off], buf[off + 1]])
-        };
-
         // Base tag size (without trailing UUID).
         let tag_len = match fmt {
             TagFormat::V3 => 16,
@@ -300,6 +325,7 @@ impl BlockTag {
         let (blocknr, flags, checksum) = match fmt {
             TagFormat::V3 => {
                 let lo = be32(buf, 0) as u64;
+                // V3 t_flags is 32-bit on disk; only the low bits are defined, so we narrow to u16.
                 let flags = be32(buf, 4) as u16;
                 let hi = be32(buf, 8) as u64;
                 let checksum = be32(buf, 12);
@@ -321,13 +347,13 @@ impl BlockTag {
         // A UUID trails the tag unless SAME_UUID is set in the parsed flags.
         let mut consumed = tag_len;
         if flags & JBD2_FLAG_SAME_UUID == 0 {
-            if buf.len() < tag_len + 16 {
+            if buf.len() < tag_len + JBD2_UUID_LEN {
                 return_errno_with_message!(
                     Errno::EINVAL,
                     "journal block tag buffer too short for trailing UUID"
                 );
             }
-            consumed += 16;
+            consumed += JBD2_UUID_LEN;
         }
 
         Ok((
