@@ -3,6 +3,9 @@
 //! NOTE: unlike ext4 metadata, jbd2 structures are stored BIG-ENDIAN on disk.
 //! Every codec here byte-swaps explicitly.
 
+use crate::prelude::*;
+use crate::return_errno_with_message;
+
 pub const JBD2_MAGIC_NUMBER: u32 = 0xC03B3998;
 
 // Block types (journal_header_t.h_blocktype)
@@ -24,3 +27,131 @@ pub const JBD2_FLAG_ESCAPE: u16 = 1;     // block began with the magic, was esca
 pub const JBD2_FLAG_SAME_UUID: u16 = 2;  // no UUID field follows this tag
 pub const JBD2_FLAG_DELETED: u16 = 4;
 pub const JBD2_FLAG_LAST_TAG: u16 = 8;   // last tag in this descriptor block
+
+/// Minimum number of bytes we must be able to read to parse the fields below.
+/// The journal superblock occupies a full block, but the fields this task cares
+/// about all live within the first 64 bytes. We require a conventional 1024-byte
+/// buffer so callers can't hand us a truncated block.
+const JBD2_SUPERBLOCK_MIN_LEN: usize = 1024;
+
+/// Parsed jbd2 journal superblock (`journal_superblock_t`).
+///
+/// Fields are OWNED, decoded big-endian from the on-disk block. We deliberately
+/// avoid `transmute`/`#[repr(C)]` overlay because jbd2 is big-endian whereas the
+/// host (and the rest of this crate) is little-endian.
+///
+/// On-disk byte offsets (from the start of the block) of the fields we decode:
+///   0  h_magic       (u32 BE) — must equal `JBD2_MAGIC_NUMBER`
+///   4  h_blocktype   (u32 BE)
+///   8  h_sequence    (u32 BE) — header sequence (unused here)
+///   12 s_blocksize   (u32 BE)
+///   16 s_maxlen      (u32 BE)
+///   20 s_first       (u32 BE)
+///   24 s_sequence    (u32 BE) — first commit ID expected in the log
+///   28 s_start       (u32 BE) — start-of-log block; 0 == clean/empty
+///   36 s_feature_compat    (u32 BE)
+///   40 s_feature_incompat  (u32 BE)
+///   44 s_feature_ro_compat (u32 BE)
+///   48 s_uuid[16]    (raw bytes)
+///   80 s_checksum_type (u8)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalSuperblock {
+    /// h_blocktype — expected to be `JBD2_SUPERBLOCK_V2` (or `_V1`).
+    pub blocktype: u32,
+    /// s_blocksize — journal block size in bytes.
+    pub blocksize: u32,
+    /// s_maxlen — total number of blocks in the journal.
+    pub maxlen: u32,
+    /// s_first — first block of log information (after the superblock).
+    pub first: u32,
+    /// s_sequence — first commit ID expected in the log.
+    pub sequence: u32,
+    /// s_start — block number of the start of log; 0 means clean/empty.
+    pub start: u32,
+    /// s_feature_compat.
+    pub feature_compat: u32,
+    /// s_feature_incompat.
+    pub feature_incompat: u32,
+    /// s_feature_ro_compat.
+    pub feature_ro_compat: u32,
+    /// s_uuid — journal UUID (raw 16 bytes).
+    pub uuid: [u8; 16],
+    /// s_checksum_type.
+    pub checksum_type: u8,
+}
+
+impl JournalSuperblock {
+    /// Decode a jbd2 journal superblock from a raw block buffer (big-endian).
+    ///
+    /// Returns `Errno::EINVAL` if the buffer is too short or `h_magic` does not
+    /// match `JBD2_MAGIC_NUMBER`.
+    pub fn parse(buf: &[u8]) -> Result<Self> {
+        if buf.len() < JBD2_SUPERBLOCK_MIN_LEN {
+            return_errno_with_message!(Errno::EINVAL, "journal superblock buffer too short");
+        }
+
+        let be32 = |off: usize| -> u32 {
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+        };
+
+        let magic = be32(0);
+        if magic != JBD2_MAGIC_NUMBER {
+            return_errno_with_message!(Errno::EINVAL, "bad jbd2 journal superblock magic");
+        }
+
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&buf[48..64]);
+
+        Ok(JournalSuperblock {
+            blocktype: be32(4),
+            blocksize: be32(12),
+            maxlen: be32(16),
+            first: be32(20),
+            sequence: be32(24),
+            start: be32(28),
+            feature_compat: be32(36),
+            feature_incompat: be32(40),
+            feature_ro_compat: be32(44),
+            uuid,
+            checksum_type: buf[80],
+        })
+    }
+
+    /// True if the given `JBD2_FEATURE_INCOMPAT_*` bit is set.
+    pub fn has_incompat(&self, bit: u32) -> bool {
+        self.feature_incompat & bit != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_superblock_parses_be_fields() {
+        let mut b = vec![0u8; 1024];
+        b[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+        b[4..8].copy_from_slice(&JBD2_SUPERBLOCK_V2.to_be_bytes());
+        b[12..16].copy_from_slice(&4096u32.to_be_bytes());   // s_blocksize
+        b[16..20].copy_from_slice(&1024u32.to_be_bytes());   // s_maxlen
+        b[20..24].copy_from_slice(&1u32.to_be_bytes());      // s_first
+        b[24..28].copy_from_slice(&7u32.to_be_bytes());      // s_sequence
+        b[28..32].copy_from_slice(&3u32.to_be_bytes());      // s_start
+        b[40..44].copy_from_slice(
+            &(JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V3).to_be_bytes());
+        let sb = JournalSuperblock::parse(&b).unwrap();
+        assert_eq!(sb.blocksize, 4096);
+        assert_eq!(sb.maxlen, 1024);
+        assert_eq!(sb.first, 1);
+        assert_eq!(sb.sequence, 7);
+        assert_eq!(sb.start, 3);
+        assert!(sb.has_incompat(JBD2_FEATURE_INCOMPAT_CSUM_V3));
+        assert!(!sb.has_incompat(JBD2_FEATURE_INCOMPAT_CSUM_V2));
+    }
+
+    #[test]
+    fn journal_superblock_rejects_bad_magic() {
+        let b = vec![0u8; 1024];               // all-zero == wrong magic
+        assert!(JournalSuperblock::parse(&b).is_err());
+    }
+}
