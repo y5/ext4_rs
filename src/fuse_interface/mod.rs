@@ -53,9 +53,45 @@ impl Ext4 {
         bkuptime: Option<u32>,
         flags: Option<u32>,
     ) {
+        // Discard the Result: the public signature returns (). The journaled
+        // wrapper guarantees the transaction is closed (commit on Ok, atomic
+        // abort on Err), so a failure leaves the fs consistent rather than
+        // half-applied.
+        let _ = self.journaled(|| {
+            self.fuse_setattr_impl(
+                ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
+                flags,
+            )
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fuse_setattr_impl(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<u32>,
+        mtime: Option<u32>,
+        ctime: Option<u32>,
+        fh: Option<u64>,
+        crtime: Option<u32>,
+        chgtime: Option<u32>,
+        bkuptime: Option<u32>,
+        flags: Option<u32>,
+    ) -> Result<()> {
         let mut inode_ref = self.get_inode_ref(ino as u32);
 
-        let mut attr = FileAttr::default();
+        // Seed from the inode's CURRENT attributes, not `FileAttr::default()`.
+        // `set_attr` writes every field unconditionally, so starting from a
+        // default would clobber every attribute the caller did not pass — most
+        // damagingly `nlink` → 0, which makes the live inode read as a deleted
+        // inode with zero dtime (e2fsck error). A partial setattr (e.g. chmod
+        // sends only `mode`) must preserve the untouched fields, so seed from
+        // the proven `from_inode_ref` reader used by `fuse_getattr`.
+        let mut attr = FileAttr::from_inode_ref(&inode_ref, self.block_size() as u32);
 
         if let Some(mode) = mode {
             let inode_file_type =
@@ -108,6 +144,7 @@ impl Ext4 {
         inode_ref.set_attr(&attr);
 
         self.write_back_inode(&mut inode_ref);
+        Ok(())
     }
 
     /// Read symbolic link.
@@ -949,6 +986,17 @@ impl Ext4 {
         name: &str,
         value: &[u8],
         flags: i32,
+        position: u32,
+    ) -> Result<usize> {
+        self.journaled_mut(|s| s.fuse_setxattr_impl(ino, name, value, flags, position))
+    }
+
+    fn fuse_setxattr_impl(
+        &mut self,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        flags: i32,
         _position: u32,
     ) -> Result<usize> {
         self.xattr_set(ino as u32, name, value, flags)?;
@@ -986,6 +1034,10 @@ impl Ext4 {
 
     /// Remove an extended attribute.
     pub fn fuse_removexattr(&mut self, ino: u64, name: &str) -> Result<usize> {
+        self.journaled_mut(|s| s.fuse_removexattr_impl(ino, name))
+    }
+
+    fn fuse_removexattr_impl(&mut self, ino: u64, name: &str) -> Result<usize> {
         self.xattr_remove(ino as u32, name)?;
         Ok(EOK)
     }
@@ -1222,6 +1274,17 @@ impl Ext4 {
         length: i64,
         mode: i32,
     ) -> Result<()> {
+        self.journaled(|| self.fuse_fallocate_impl(ino, fh, offset, length, mode))
+    }
+
+    fn fuse_fallocate_impl(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+    ) -> Result<()> {
         const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
         const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
         const SUPPORTED: i32 = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
@@ -1383,6 +1446,25 @@ impl Ext4 {
 
     /// Copy the specified range from the source inode to the destination inode
     pub fn fuse_copy_file_range(
+        &self,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: i64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: i64,
+        len: u64,
+        flags: u32,
+    ) -> Result<usize> {
+        self.journaled(|| {
+            self.fuse_copy_file_range_impl(
+                ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fuse_copy_file_range_impl(
         &self,
         ino_in: u64,
         fh_in: u64,

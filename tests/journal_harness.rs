@@ -1033,6 +1033,161 @@ fn journaled_rename_crash_recovers_4k() {
     fsck_clean(&img);
 }
 
+// ---------------------------------------------------------------------------
+// Journaled setattr/truncate/fallocate/xattr ops (Task 6.4). The object is
+// created+committed in its own session first, then a SEPARATE session injects a
+// crash at the op's own commit (AfterCommitBlock). Recovery on the next mount
+// replays the durable-but-uncheckpointed txn, so the op takes effect atomically
+// and the image is e2fsck-clean.
+// ---------------------------------------------------------------------------
+
+/// Truncate (shrink) a file via the journaled `truncate_inode` primitive — the
+/// genuine production shrink path, which frees the extents and is the same op
+/// the block_size_harness exercises. A size-only `fuse_setattr` is a lossy
+/// metadata setter that neither frees blocks nor preserves the other inode
+/// fields, so it is unsuitable for driving a real truncate; the dedicated
+/// `journaled_setattr_*` test below covers the `fuse_setattr` wrapper with a
+/// non-destructive mode change.
+#[test]
+fn journaled_truncate_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jtruncate");
+    let big = vec![0xABu8; 10_000];
+    let new_len = 3000u64;
+    {
+        // Create the file with N bytes durably (committed + checkpointed).
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "t.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &big).expect("write");
+    }
+    {
+        // Separate session: crash at the truncate's own commit.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        let ino = fs
+            .generic_open("/t.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("resolve");
+        let mut inode_ref = fs.get_inode_ref(ino);
+        fs.truncate_inode(&mut inode_ref, new_len).expect("truncate");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/t.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("file present after recovery");
+        let attr = fs.fuse_getattr(ino as u64).expect("getattr");
+        assert_eq!(attr.size, new_len, "file shrunk to the new size after recovery");
+    }
+    fsck_clean(&img);
+}
+
+/// Change an inode's mode through the journaled `fuse_setattr` wrapper, crashing
+/// at its commit. Recovery must replay the metadata change and stay fsck-clean.
+#[test]
+fn journaled_setattr_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jsetattr");
+    let new_mode = (InodeFileType::S_IFREG.bits() | 0o600) as u32;
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.create(ROOT_INODE, "s.bin", reg_mode()).expect("create");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        let ino = fs
+            .generic_open("/s.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("resolve");
+        // Only `mode` set; fuse_setattr returns () (its txn aborts on error).
+        fs.fuse_setattr(
+            ino as u64, Some(new_mode), None, None, None, None, None, None, None, None, None, None,
+            None,
+        );
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/s.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("file present after recovery");
+        let attr = fs.fuse_getattr(ino as u64).expect("getattr");
+        assert_eq!(attr.perm.bits(), 0o600, "mode change replayed after recovery");
+    }
+    fsck_clean(&img);
+}
+
+/// Extend a file with journaled `fuse_fallocate` (mode 0), crashing at its
+/// commit. Recovery must replay the allocation; the file ends at the allocated
+/// size and the image is fsck-clean.
+#[test]
+fn journaled_fallocate_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jfallocate");
+    let alloc_len = 20_000i64;
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.create(ROOT_INODE, "a.bin", reg_mode()).expect("create");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        let ino = fs
+            .generic_open("/a.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("resolve");
+        // mode 0: allocate [0, alloc_len) and grow the size to cover it.
+        fs.fuse_fallocate(ino as u64, 0, 0, alloc_len, 0).expect("fallocate");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/a.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("file present after recovery");
+        let attr = fs.fuse_getattr(ino as u64).expect("getattr");
+        assert_eq!(attr.size, alloc_len as u64, "file allocated to size after recovery");
+    }
+    fsck_clean(&img);
+}
+
+/// Set a `user.foo` xattr via the journaled `fuse_setxattr` wrapper, crashing at
+/// its commit. Recovery must replay the xattr; it reads back and is fsck-clean.
+#[test]
+fn journaled_setxattr_crash_recovers_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jsetxattr");
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.create(ROOT_INODE, "x.bin", reg_mode()).expect("create");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_journaled(dev).expect("open_journaled");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        let ino = fs
+            .generic_open("/x.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("resolve");
+        fs.fuse_setxattr(ino as u64, "user.foo", b"bar", 0, 0).expect("setxattr");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let mut fs = Ext4::open_and_recover(dev).expect("recover");
+        let ino = fs
+            .generic_open("/x.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("file present after recovery");
+        let val = fs.fuse_getxattr(ino as u64, "user.foo", 0).expect("getxattr");
+        assert_eq!(val, b"bar", "xattr replayed after recovery");
+    }
+    fsck_clean(&img);
+}
+
 #[test]
 fn crash_before_checkpoint_recovers_1k() {
     crash_before_checkpoint_recovers(1024);

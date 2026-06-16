@@ -424,6 +424,10 @@ impl Ext4 {
     /// Set (create or replace) an extended attribute. `flags` may be
     /// XATTR_CREATE (fail if present) or XATTR_REPLACE (fail if absent).
     pub fn xattr_set(&self, ino: u32, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        self.journaled(|| self.xattr_set_impl(ino, name, value, flags))
+    }
+
+    fn xattr_set_impl(&self, ino: u32, name: &str, value: &[u8], flags: i32) -> Result<()> {
         let (idx, suffix) = match split_name(name) {
             Some(v) => v,
             None => return_errno_with_message!(Errno::ENOTSUP, "unsupported xattr namespace"),
@@ -455,6 +459,10 @@ impl Ext4 {
 
     /// Remove an extended attribute, or ENODATA if it is not present.
     pub fn xattr_remove(&self, ino: u32, name: &str) -> Result<()> {
+        self.journaled(|| self.xattr_remove_impl(ino, name))
+    }
+
+    fn xattr_remove_impl(&self, ino: u32, name: &str) -> Result<()> {
         let (idx, suffix) = match split_name(name) {
             Some(v) => v,
             None => return_errno_with_message!(Errno::ENODATA, "unsupported xattr namespace"),

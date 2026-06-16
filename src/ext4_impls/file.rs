@@ -713,6 +713,10 @@ impl Ext4 {
     /// Returns:
     /// `Result<usize>` - status of the operation
     pub fn truncate_inode(&self, inode_ref: &mut Ext4InodeRef, new_size: u64) -> Result<usize> {
+        self.journaled(|| self.truncate_inode_impl(inode_ref, new_size))
+    }
+
+    fn truncate_inode_impl(&self, inode_ref: &mut Ext4InodeRef, new_size: u64) -> Result<usize> {
         let old_size = inode_ref.inode.size();
 
         // grow-via-truncate is unsupported, callers should use write_at instead
