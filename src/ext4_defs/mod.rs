@@ -6,6 +6,7 @@ pub mod ext4;
 pub mod extents;
 pub mod file;
 pub mod inode;
+pub mod journal;
 pub mod mount_point;
 pub mod super_block;
 
@@ -17,5 +18,6 @@ pub use ext4::*;
 pub use extents::*;
 pub use file::*;
 pub use inode::*;
+pub use journal::*;
 pub use mount_point::*;
 pub use super_block::*;
