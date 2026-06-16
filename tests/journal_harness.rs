@@ -1527,3 +1527,45 @@ fn e2fsck_recovers_dirty_image_without_warning_4k() {
         String::from_utf8_lossy(&recheck.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 7.4: authentic kernel-produced dirty-journal replay (Tier 3).
+//
+// Stock mkfs.ext4 here lays down a V1 (no-csum) journal, and our crate emits its
+// own journals at V1 / forced-CSUM_V3. The remaining gap is journals written by
+// a REAL Linux kernel (CSUM_V3, multi-transaction, real escape sequences).
+// Capturing one needs root (loop-mount, write, snapshot mid-flight) — see
+// scripts/make-dirty-fixture.sh. This sandbox is non-root, so the test below is
+// #[ignore]d AND env-gated: it only runs when a privileged operator has placed
+// fixture images under tests/fixtures/dirty/.
+// ---------------------------------------------------------------------------
+
+/// Authentic kernel-produced dirty-journal replay (Tier 3). Ignored by default:
+/// requires fixture images under tests/fixtures/dirty/ produced by a privileged
+/// run of scripts/make-dirty-fixture.sh (this sandbox is non-root). Run with:
+///   EXT4_KERNEL_FIXTURES=1 cargo test --test journal_harness kernel_dirty -- --ignored
+#[test]
+#[ignore]
+fn kernel_dirty_fixtures_recover_clean() {
+    if std::env::var("EXT4_KERNEL_FIXTURES").is_err() {
+        eprintln!("skip: set EXT4_KERNEL_FIXTURES=1 and provide fixtures under tests/fixtures/dirty/");
+        return;
+    }
+    let dir = std::path::Path::new("tests/fixtures/dirty");
+    let mut ran = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("img") { continue; }
+            // Work on a copy (recovery mutates the image).
+            let scratch = std::path::Path::new("target").join("kernel_dirty_scratch.img");
+            std::fs::copy(&p, &scratch).unwrap();
+            let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&scratch));
+            let _fs = Ext4::open_and_recover(dev).expect("recover kernel fixture");
+            fsck_clean(&scratch);
+            ran += 1;
+            eprintln!("recovered kernel fixture: {}", p.display());
+        }
+    }
+    assert!(ran > 0, "no fixtures found under tests/fixtures/dirty/ (did the script run?)");
+}
