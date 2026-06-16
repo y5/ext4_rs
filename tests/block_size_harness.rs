@@ -2914,3 +2914,83 @@ fn htree_create_4k() {
 fn htree_create_1k() {
     htree_create_roundtrip(1024, 400);
 }
+
+#[test]
+fn htree_create_multilevel_1k() {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    // Long names pack ~5 entries per 1 KiB leaf, so ~1000 entries need far more
+    // than the ~123 root slots — forcing the dx_root to grow to depth 1.
+    let img = fresh_image(1024, "htdeep");
+    let pad = "_".repeat(190);
+    let n = 1000usize;
+    let mut names = Vec::with_capacity(n);
+    {
+        let ext4 = open_fs(&img);
+        for i in 0..n {
+            let name = format!("entry_{:05}{}", i, pad);
+            ext4.create(ROOT_INODE, &name, reg_mode())
+                .unwrap_or_else(|_| panic!("create #{i} failed"));
+            names.push(name);
+        }
+    }
+
+    fsck_clean(&img);
+    assert!(
+        debugfs_htree_levels(&img, "/") >= 1,
+        "tree did not grow to multi-level; depth growth untested"
+    );
+
+    let ext4 = open_fs(&img);
+    assert!(ext4.get_inode_ref(ROOT_INODE).inode.is_index());
+    for name in &names {
+        let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        ext4.dir_find_entry(ROOT_INODE, name, &mut res)
+            .unwrap_or_else(|_| panic!("lookup failed for an entry"));
+        assert!(res.dentry.inode != 0);
+    }
+}
+
+#[test]
+fn htree_remove_keeps_index_valid_4k() {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image(4096, "htrm");
+    let n = 400usize;
+    let mut names = Vec::with_capacity(n);
+    {
+        let ext4 = open_fs(&img);
+        for i in 0..n {
+            let name = format!("entry_{:05}.dat", i);
+            ext4.create(ROOT_INODE, &name, reg_mode())
+                .unwrap_or_else(|_| panic!("create #{i}"));
+            names.push(name);
+        }
+        // Remove every other entry through the index.
+        for name in names.iter().step_by(2) {
+            ext4.fuse_unlink(ROOT_INODE as u64, name)
+                .unwrap_or_else(|_| panic!("unlink {name}"));
+        }
+    }
+
+    // The index (and freed inodes) must leave a consistent filesystem.
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(ext4.get_inode_ref(ROOT_INODE).inode.is_index());
+    for (i, name) in names.iter().enumerate() {
+        let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        let r = ext4.dir_find_entry(ROOT_INODE, name, &mut res);
+        if i % 2 == 0 {
+            assert_eq!(
+                r.unwrap_err().error(),
+                Errno::ENOENT,
+                "removed entry still present: {name}"
+            );
+        } else {
+            r.unwrap_or_else(|_| panic!("surviving entry vanished: {name}"));
+        }
+    }
+}
