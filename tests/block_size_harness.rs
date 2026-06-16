@@ -1785,3 +1785,55 @@ fn readdir_chunked_1k() {
 fn readdir_chunked_4k() {
     readdir_chunked(4096);
 }
+
+// --- multi-block directory growth ---
+
+/// Create enough entries with the crate that the directory grows past its first
+/// block, then require e2fsck to be clean. Each directory leaf block carries a
+/// tail checksum seeded with the directory's inode number; an appended block
+/// (whose first entry is a regular file, not ".") must still be seeded with the
+/// directory inode, or e2fsck reports "directory ... fails checksum". Every
+/// created name must also still resolve afterwards.
+fn dir_multiblock(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "dirgrow");
+
+    // 300 short-named entries span several blocks at 1 KiB and more than one at
+    // 4 KiB (~255 entries per 4 KiB block).
+    let n = 300usize;
+    {
+        let ext4 = open_fs(&img);
+        for i in 0..n {
+            ext4.create(ROOT_INODE, &format!("f{i:04}"), reg_mode())
+                .expect("create");
+        }
+    }
+    fsck_clean(&img); // appended directory blocks must checksum correctly
+
+    // Confirm the directory actually grew past one block.
+    let ext4 = open_fs(&img);
+    let size = ext4.get_inode_ref(ROOT_INODE).inode.size();
+    assert!(
+        size > block_size as u64,
+        "root directory did not grow past one block ({size} bytes) @ {block_size}"
+    );
+
+    // Every name still resolves.
+    for i in 0..n {
+        assert!(
+            resolve(&ext4, &format!("/f{i:04}")).is_some(),
+            "entry f{i:04} missing @ {block_size}"
+        );
+    }
+}
+
+#[test]
+fn dir_multiblock_1k() {
+    dir_multiblock(1024);
+}
+#[test]
+fn dir_multiblock_4k() {
+    dir_multiblock(4096);
+}

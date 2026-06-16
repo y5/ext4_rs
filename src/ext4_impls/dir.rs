@@ -208,13 +208,15 @@ impl Ext4 {
         entries
     }
 
-    pub fn dir_set_csum(&self, dst_blk: &mut Block, ino_gen: u32) {
-        let parent_de: Ext4DirEntry = dst_blk.read_offset_as(0);
-
+    /// Recompute and store a directory leaf block's tail checksum. `dir_ino` is
+    /// the inode number of the directory that owns the block — it seeds the
+    /// checksum and must be passed explicitly, since an appended block's first
+    /// entry is a regular entry rather than "." (see `ext4_dir_block_csum`).
+    pub fn dir_set_csum(&self, dst_blk: &mut Block, dir_ino: u32, ino_gen: u32) {
         let tail_offset = self.block_size() - size_of::<Ext4DirEntryTail>();
         let mut tail: Ext4DirEntryTail = *dst_blk.read_offset_as_mut(tail_offset);
 
-        tail.tail_set_csum(&self.super_block, &parent_de, &dst_blk.data[..], ino_gen);
+        tail.tail_set_csum(&self.super_block, dir_ino, ino_gen, &dst_blk.data[..]);
 
         tail.copy_to_slice(&mut dst_blk.data);
     }
@@ -259,7 +261,7 @@ impl Ext4 {
 
             if result.is_ok() {
                 // set checksum
-                self.dir_set_csum(&mut ext4block, parent.inode.generation());
+                self.dir_set_csum(&mut ext4block, parent.inode_num, parent.inode.generation());
                 ext4block.sync_blk_to_disk(&self.block_device);
 
                 return Ok(EOK);
@@ -280,7 +282,7 @@ impl Ext4 {
         self.insert_to_new_block(&mut new_ext4block, child.inode_num, name, de_type);
 
         // set checksum
-        self.dir_set_csum(&mut new_ext4block, parent.inode.generation());
+        self.dir_set_csum(&mut new_ext4block, parent.inode_num, parent.inode.generation());
         new_ext4block.sync_blk_to_disk(&self.block_device);
 
         Ok(EOK)
@@ -444,7 +446,7 @@ impl Ext4 {
             tmp_de_mut.entry_len = de_len + del_len;
         }
 
-        self.dir_set_csum(&mut ext4block, parent.inode.generation());
+        self.dir_set_csum(&mut ext4block, parent.inode_num, parent.inode.generation());
         ext4block.sync_blk_to_disk(&self.block_device);
 
         Ok(EOK)
@@ -475,7 +477,7 @@ impl Ext4 {
         de.inner.inode_type = de_type.bits();
 
         let gen = self.get_inode_ref(parent_ino).inode.generation();
-        self.dir_set_csum(&mut blk, gen);
+        self.dir_set_csum(&mut blk, parent_ino, gen);
         blk.sync_blk_to_disk(&self.block_device);
 
         Ok(EOK)

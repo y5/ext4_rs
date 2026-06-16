@@ -191,23 +191,28 @@ impl Ext4DirEntry {
 }
 
 impl Ext4DirEntry {
-    /// Get the checksum of the directory entry.
-    #[allow(unused)]
-    pub fn ext4_dir_get_csum(&self, s: &Ext4Superblock, blk_data: &[u8], ino_gen: u32) -> u32 {
-        let ino_index = self.inode;
-
-        let mut csum = 0;
-
+    /// Compute a directory leaf block's tail checksum.
+    ///
+    /// The seed is the filesystem UUID followed by the *directory's* inode
+    /// number and generation — not the inode of whatever entry sits at offset 0.
+    /// Those only coincide for the first block, whose offset-0 entry is "."
+    /// (`.inode` == the directory inode). Appended blocks start with an ordinary
+    /// entry, so the directory inode must be supplied explicitly or the seed is
+    /// wrong and e2fsck rejects the block.
+    pub fn ext4_dir_block_csum(
+        s: &Ext4Superblock,
+        dir_ino: u32,
+        ino_gen: u32,
+        blk_data: &[u8],
+    ) -> u32 {
         let uuid = s.uuid;
-
-        csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid, uuid.len() as u32);
-        csum = ext4_crc32c(csum, &ino_index.to_le_bytes(), 4);
+        let mut csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid, uuid.len() as u32);
+        csum = ext4_crc32c(csum, &dir_ino.to_le_bytes(), 4);
         csum = ext4_crc32c(csum, &ino_gen.to_le_bytes(), 4);
         // CRC the block up to (but not including) the tail. The tail size is
         // fixed; the block size comes from the superblock.
         let block_data_size = s.block_size() as usize - core::mem::size_of::<Ext4DirEntryTail>();
-        csum = ext4_crc32c(csum, &blk_data[..block_data_size], block_data_size as u32);
-        csum
+        ext4_crc32c(csum, &blk_data[..block_data_size], block_data_size as u32)
     }
 
     /// Write de to block
@@ -245,12 +250,11 @@ impl Ext4DirEntryTail {
     pub fn tail_set_csum(
         &mut self,
         s: &Ext4Superblock,
-        diren: &Ext4DirEntry,
-        blk_data: &[u8],
+        dir_ino: u32,
         ino_gen: u32,
+        blk_data: &[u8],
     ) {
-        let csum = diren.ext4_dir_get_csum(s, blk_data, ino_gen);
-        self.checksum = csum;
+        self.checksum = Ext4DirEntry::ext4_dir_block_csum(s, dir_ino, ino_gen, blk_data);
     }
 
     pub fn copy_to_slice(&self, array: &mut [u8]) {
