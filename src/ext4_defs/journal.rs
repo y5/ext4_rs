@@ -117,6 +117,37 @@ impl JournalSuperblock {
         })
     }
 
+    /// Encode this superblock into a fresh, zeroed journal block (big-endian).
+    ///
+    /// Mirrors [`Self::parse`] offset-for-offset. The returned buffer is at least
+    /// one block long: `max(self.blocksize, JBD2_SUPERBLOCK_MIN_LEN)` bytes, so it
+    /// can be written directly back to the journal's superblock block. The
+    /// checksum field (`s_checksum`) is left zero; checksum computation is the
+    /// caller's / a later task's responsibility.
+    pub fn emit(&self) -> Vec<u8> {
+        let len = core::cmp::max(self.blocksize as usize, JBD2_SUPERBLOCK_MIN_LEN);
+        let mut buf = vec![0u8; len];
+
+        let put32 = |buf: &mut [u8], off: usize, v: u32| {
+            buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+        };
+
+        put32(&mut buf, 0, JBD2_MAGIC_NUMBER); // h_magic
+        put32(&mut buf, 4, self.blocktype); // h_blocktype
+        put32(&mut buf, 12, self.blocksize); // s_blocksize
+        put32(&mut buf, 16, self.maxlen); // s_maxlen
+        put32(&mut buf, 20, self.first); // s_first
+        put32(&mut buf, 24, self.sequence); // s_sequence
+        put32(&mut buf, 28, self.start); // s_start
+        put32(&mut buf, 36, self.feature_compat); // s_feature_compat
+        put32(&mut buf, 40, self.feature_incompat); // s_feature_incompat
+        put32(&mut buf, 44, self.feature_ro_compat); // s_feature_ro_compat
+        buf[48..64].copy_from_slice(&self.uuid); // s_uuid
+        buf[80] = self.checksum_type; // s_checksum_type
+
+        buf
+    }
+
     /// True if the given `JBD2_FEATURE_INCOMPAT_*` bit is set.
     pub fn has_incompat(&self, bit: u32) -> bool {
         self.feature_incompat & bit != 0
@@ -147,6 +178,41 @@ mod tests {
         assert_eq!(sb.start, 3);
         assert!(sb.has_incompat(JBD2_FEATURE_INCOMPAT_CSUM_V3));
         assert!(!sb.has_incompat(JBD2_FEATURE_INCOMPAT_CSUM_V2));
+    }
+
+    #[test]
+    fn journal_superblock_emit_roundtrips() {
+        // Build an sb by parsing a hand-made block, emit it, re-parse, assert equal.
+        let mut b = vec![0u8; 1024];
+        b[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+        b[4..8].copy_from_slice(&JBD2_SUPERBLOCK_V2.to_be_bytes());
+        b[12..16].copy_from_slice(&2048u32.to_be_bytes());
+        b[16..20].copy_from_slice(&512u32.to_be_bytes());
+        b[20..24].copy_from_slice(&1u32.to_be_bytes());
+        b[24..28].copy_from_slice(&42u32.to_be_bytes());
+        b[28..32].copy_from_slice(&9u32.to_be_bytes());
+        b[36..40].copy_from_slice(&0u32.to_be_bytes());
+        b[40..44].copy_from_slice(&(JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_CSUM_V3).to_be_bytes());
+        b[44..48].copy_from_slice(&0u32.to_be_bytes());
+        let uuid = [0x11u8; 16];
+        b[48..64].copy_from_slice(&uuid);
+        b[80] = 4; // checksum_type
+        let sb = JournalSuperblock::parse(&b).unwrap();
+
+        let out = sb.emit();
+        // Emitted bytes must be at least one block and re-parse to an equal sb.
+        let sb2 = JournalSuperblock::parse(&out).unwrap();
+        assert_eq!(sb2.blocksize, 2048);
+        assert_eq!(sb2.maxlen, 512);
+        assert_eq!(sb2.first, 1);
+        assert_eq!(sb2.sequence, 42);
+        assert_eq!(sb2.start, 9);
+        assert_eq!(sb2.feature_incompat, JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_CSUM_V3);
+        assert_eq!(sb2.uuid, uuid);
+        assert_eq!(sb2.checksum_type, 4);
+        // Magic + blocktype land big-endian at 0 / 4.
+        assert_eq!(&out[0..4], &JBD2_MAGIC_NUMBER.to_be_bytes());
+        assert_eq!(&out[4..8], &JBD2_SUPERBLOCK_V2.to_be_bytes());
     }
 
     #[test]
