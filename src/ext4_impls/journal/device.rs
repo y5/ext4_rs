@@ -25,6 +25,9 @@ struct DevState {
 /// for read-your-writes consistency. With no transaction open it is a
 /// transparent pass-through.
 pub struct JournalDevice {
+    // INVARIANT: `inner` is the raw backing device, never a wrapper that re-enters
+    // this JournalDevice. We hold `state` (a non-reentrant spin::Mutex) across
+    // inner.read_offset(...) during capture; a re-entrant inner would deadlock.
     inner: Arc<dyn BlockDevice>,
     block_size: usize,
     state: Mutex<DevState>,
@@ -236,5 +239,33 @@ mod tests {
         assert!(jd.end().is_none()); // inner level: no txn yet
         let txn = jd.end().expect("outer level returns the shared txn");
         assert_eq!(txn.blocks.len(), 1);
+    }
+
+    #[test]
+    fn captures_write_spanning_two_blocks() {
+        let inner = Arc::new(MemDev::new(4096));
+        // seed blocks 0 and 1 with distinct backgrounds.
+        inner.write_offset(0, &vec![0x11; 512]);   // block 0
+        inner.write_offset(512, &vec![0x22; 512]); // block 1
+        let jd = JournalDevice::new(inner.clone(), 512);
+        jd.begin(1);
+        // write 600 bytes starting at offset 200: covers block 0 bytes [200..512)
+        // (312 bytes) and block 1 bytes [0..288) (288 bytes) = 600 total.
+        jd.write_offset(200, &vec![0xEE; 600]);
+        let txn = jd.end().unwrap();
+        assert_eq!(txn.blocks.len(), 2, "write spans two blocks");
+        let b0 = &txn.blocks[&0].data;
+        let b1 = &txn.blocks[&1].data;
+        assert_eq!(b0.len(), 512);
+        assert_eq!(b1.len(), 512);
+        // block 0: [0..200) background 0x11, [200..512) overwritten 0xEE
+        assert_eq!(&b0[0..200], &vec![0x11; 200][..]);
+        assert_eq!(&b0[200..512], &vec![0xEE; 312][..]);
+        // block 1: [0..288) overwritten 0xEE, [288..512) background 0x22
+        assert_eq!(&b1[0..288], &vec![0xEE; 288][..]);
+        assert_eq!(&b1[288..512], &vec![0x22; 224][..]);
+        // inner device untouched by the captured write.
+        assert_eq!(inner.read_offset(0, 512), vec![0x11; 512]);
+        assert_eq!(inner.read_offset(512, 512), vec![0x22; 512]);
     }
 }
