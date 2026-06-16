@@ -17,11 +17,11 @@ pub use device::*;
 // reachable from the crate root alongside the `Journal` engine. Recovery and the
 // test harness assemble/parse/verify log blocks with these.
 pub use crate::ext4_defs::journal::{
-    assemble_descriptor_block, finalize_commit_csum, finalize_revoke_csum,
-    jbd2_block_csum, jbd2_csum_seed, jbd2_data_block_csum, parse_descriptor_block,
-    patch_journal_sb_head, verify_commit_csum, verify_revoke_csum, BlockTag, CommitBlock,
-    JournalSuperblock, RevokeBlock, TagFormat, JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK,
-    JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2,
+    assemble_descriptor_block, descriptor_block_tag_capacity, finalize_commit_csum,
+    finalize_revoke_csum, jbd2_block_csum, jbd2_csum_seed, jbd2_data_block_csum,
+    parse_descriptor_block, patch_journal_sb_head, verify_commit_csum, verify_revoke_csum,
+    BlockTag, CommitBlock, JournalSuperblock, RevokeBlock, TagFormat, JBD2_COMMIT_BLOCK,
+    JBD2_DESCRIPTOR_BLOCK, JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2,
     JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FEATURE_INCOMPAT_REVOKE, JBD2_FLAG_DELETED,
     JBD2_FLAG_ESCAPE, JBD2_FLAG_LAST_TAG, JBD2_FLAG_SAME_UUID, JBD2_MAGIC_NUMBER,
     JBD2_REVOKE_BLOCK,
@@ -69,7 +69,40 @@ pub struct Journal {
     pub inode_ref: Ext4InodeRef,
 }
 
+/// The LIVE on-disk journal superblock plus the format/feature context derived
+/// from it. Recovery and commit both anchor on the live sb, so these fields are
+/// the single source of truth for "what format is this journal".
+struct LiveSb {
+    sb: JournalSuperblock,
+    fmt: TagFormat,
+    has_64bit: bool,
+    has_csum: bool,
+    seed: u32,
+}
+
 impl Journal {
+    /// Read the LIVE on-disk journal superblock (log block 0) and derive the
+    /// format/feature context. Recovery and commit BOTH anchor on the live sb
+    /// (not the cached `self.sb`), so this is the single source of truth for the
+    /// "what format is this journal" question.
+    fn live_sb(&self, fs: &Ext4) -> Result<LiveSb> {
+        let sb_block = self.read_log_block(fs, 0)?;
+        let sb = JournalSuperblock::parse(&sb_block)?;
+        let fmt = TagFormat::from_features(sb.feature_incompat);
+        let has_64bit = sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+        let has_csum = sb.feature_incompat
+            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+            != 0;
+        let seed = jbd2_csum_seed(&sb.uuid);
+        Ok(LiveSb {
+            sb,
+            fmt,
+            has_64bit,
+            has_csum,
+            seed,
+        })
+    }
+
     /// Load the journal from journal inode 8. Returns:
     /// - `Ok(None)` if the fs has no `has_journal` feature, or the journal
     ///   superblock has a bad magic (treated as "no journal", per design).
@@ -126,15 +159,13 @@ impl Journal {
         // s_sequence are set when the journal goes dirty, after `Journal::load`
         // cached `self.sb`. Re-read log block 0 so the walk anchors on the live
         // (dirty) region rather than the stale cached state.
-        let sb_buf = self.read_log_block(fs, 0)?;
-        let sb = JournalSuperblock::parse(&sb_buf)?;
-
-        let fmt = TagFormat::from_features(sb.feature_incompat);
-        let has_64bit = sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
-        let has_csum = sb.feature_incompat
-            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
-            != 0;
-        let seed = jbd2_csum_seed(&sb.uuid);
+        let LiveSb {
+            sb,
+            fmt,
+            has_64bit,
+            has_csum,
+            seed,
+        } = self.live_sb(fs)?;
 
         let first = sb.first;
         let maxlen = sb.maxlen;
@@ -240,21 +271,19 @@ impl Journal {
         // 2. Re-read the LIVE on-disk superblock (log block 0) and derive the
         // feature flags / csum seed exactly as `scan`/`build_revoke_table` do, so
         // the log we emit matches what recovery will parse.
-        let sb_buf = self.read_log_block(fs, 0)?;
-        let sb = JournalSuperblock::parse(&sb_buf)?;
-        let fmt = TagFormat::from_features(sb.feature_incompat);
-        let has_64bit = sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
-        let has_csum = sb.feature_incompat
-            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
-            != 0;
-        let seed = jbd2_csum_seed(&sb.uuid);
+        let ctx = self.live_sb(fs)?;
+        let fmt = ctx.fmt;
+        let has_64bit = ctx.has_64bit;
+        let has_csum = ctx.has_csum;
+        let seed = ctx.seed;
         let bs = fs.block_size();
-        let first = sb.first;
-        let maxlen = sb.maxlen;
+        let first = ctx.sb.first;
+        let maxlen = ctx.sb.maxlen;
         let seq = txn.sequence;
 
         // A log cursor that wraps back to `first` once it reaches the end of the
         // journal area, mirroring the SCAN walk.
+        // this engine commits one txn at a time; the log always starts at s_first
         let mut cursor = first;
         let mut advance = |c: &mut u32| {
             *c += 1;
@@ -292,10 +321,10 @@ impl Journal {
             logged_copies.push(logged);
         }
 
-        // Single-descriptor guard: conservatively bound the tag run. 12-byte header,
-        // up to 16 bytes per tag (V3) + 16-byte UUID after the first tag + 4-byte
-        // tail checksum. If it would exceed one block, bail loudly.
-        if 12 + tags.len() * 16 + 16 + 4 > bs {
+        // Single-descriptor guard: format-aware via the shared codec helper, which
+        // accounts for the header, first-tag UUID, per-format tag size, and tail
+        // checksum. If the tags would exceed one block, bail loudly.
+        if tags.len() > descriptor_block_tag_capacity(bs, fmt, has_64bit, has_csum) {
             return_errno_with_message!(
                 Errno::ENOSPC,
                 "txn too large for one descriptor block"
@@ -334,6 +363,7 @@ impl Journal {
         // the commit becomes durable. A crash here → recovery scans from `first`,
         // finds the descriptor but no valid commit → discards the partial txn.
         // Safe: commit() hasn't returned, so losing this txn is fine.
+        // re-read + patch in place to preserve sb fields the parser doesn't model (s_checksum, etc.); see recover()
         let mut sb_block = self.read_log_block(fs, 0)?;
         patch_journal_sb_head(&mut sb_block, seq, first);
         self.write_log_block(fs, 0, &sb_block)?;
@@ -343,7 +373,7 @@ impl Journal {
         // the txn is durably committed; a crash now → recovery replays it.
         let mut commit_blk = CommitBlock {
             sequence: seq,
-            commit_sec: 0,
+            commit_sec: 0, // timestamps are not used by recovery
             commit_nsec: 0,
         }
         .emit(bs);
@@ -382,13 +412,12 @@ impl Journal {
     pub fn build_revoke_table(&self, fs: &Ext4, scan: &ScanResult) -> Result<BTreeMap<u64, u32>> {
         // Anchor feature flags / seed on the LIVE on-disk superblock, exactly as
         // `scan` does: re-read log block 0 and derive has_64bit/has_csum/seed.
-        let sb_buf = self.read_log_block(fs, 0)?;
-        let sb = JournalSuperblock::parse(&sb_buf)?;
-        let has_64bit = sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
-        let has_csum = sb.feature_incompat
-            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
-            != 0;
-        let seed = jbd2_csum_seed(&sb.uuid);
+        let LiveSb {
+            has_64bit,
+            has_csum,
+            seed,
+            ..
+        } = self.live_sb(fs)?;
 
         let mut table: BTreeMap<u64, u32> = BTreeMap::new();
         for txn in &scan.txns {

@@ -12,6 +12,13 @@ pub const JBD2_MAGIC_NUMBER: u32 = 0xC03B3998;
 /// Length in bytes of a jbd2 UUID field (`s_uuid` / a block-tag's trailing UUID).
 const JBD2_UUID_LEN: usize = 16;
 
+/// Length in bytes of the jbd2 journal header (`journal_header_t`): h_magic,
+/// h_blocktype, h_sequence (3 × BE u32).
+pub const JBD2_HEADER_LEN: usize = 12;
+
+/// Length in bytes of the descriptor-block tail checksum (CSUM_V2/V3).
+const JBD2_TAIL_CSUM_LEN: usize = 4;
+
 // Big-endian read/write helpers shared by every codec in this module. jbd2 is
 // big-endian on disk; these centralize the byte-swapping so the codecs read
 // uniformly. Callers are responsible for length-guarding before calling.
@@ -571,6 +578,30 @@ impl RevokeBlock {
 // to the log, and are the SAME functions recovery uses to read/verify a log.
 // ---------------------------------------------------------------------------
 
+/// Max number of block tags that fit in a single descriptor block of
+/// `block_size` for the given tag format. Accounts for the journal header, the
+/// first tag's UUID, per-format tag size, and the tail checksum (when has_csum).
+pub fn descriptor_block_tag_capacity(
+    block_size: usize,
+    fmt: TagFormat,
+    has_64bit: bool,
+    has_csum: bool,
+) -> usize {
+    let tag_size = match fmt {
+        TagFormat::V3 => 16,
+        _ => {
+            if has_64bit {
+                12
+            } else {
+                8
+            }
+        }
+    };
+    let overhead =
+        JBD2_HEADER_LEN + JBD2_UUID_LEN + if has_csum { JBD2_TAIL_CSUM_LEN } else { 0 };
+    block_size.saturating_sub(overhead) / tag_size
+}
+
 /// Assemble a complete DESCRIPTOR block (big-endian) into a fresh `block_size`
 /// buffer.
 ///
@@ -593,6 +624,10 @@ pub fn assemble_descriptor_block(
     has_csum: bool,
     tags: &[BlockTag],
 ) -> Vec<u8> {
+    debug_assert!(
+        tags.len() <= descriptor_block_tag_capacity(block_size, fmt, has_64bit, has_csum),
+        "descriptor overflow"
+    );
     let mut block = vec![0u8; block_size];
     put_be32(&mut block, 0, JBD2_MAGIC_NUMBER); // h_magic
     put_be32(&mut block, 4, JBD2_DESCRIPTOR_BLOCK); // h_blocktype
@@ -1077,5 +1112,14 @@ mod tests {
             TagFormat::V2
         );
         assert_eq!(TagFormat::from_features(0), TagFormat::V1);
+    }
+
+    #[test]
+    fn descriptor_capacity_basic() {
+        // V1, no-csum, no-64bit: 8-byte tags. Overhead = 12 (header) + 16 (uuid).
+        assert_eq!(
+            descriptor_block_tag_capacity(1024, TagFormat::V1, false, false),
+            (1024 - 28) / 8
+        );
     }
 }
