@@ -12,10 +12,12 @@ use std::sync::Arc;
 use ext4_rs::{
     assemble_descriptor_block, finalize_commit_csum, finalize_revoke_csum, jbd2_csum_seed,
     jbd2_data_block_csum, parse_descriptor_block, patch_journal_sb_head, verify_commit_csum,
-    BlockDevice, BlockTag, CommitBlock, Ext4, Journal, RevokeBlock, TagFormat,
+    BlockDevice, BlockTag, CommitBlock, Ext4, InodeFileType, Journal, RevokeBlock, TagFormat,
     JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3,
     JBD2_FLAG_LAST_TAG,
 };
+
+const ROOT_INODE: u32 = 2;
 
 /// A file-backed block device over an on-disk image.
 struct FileBlockDevice {
@@ -60,6 +62,25 @@ fn tool_missing(name: &str) -> bool {
         .output()
         .map(|_| false)
         .unwrap_or(true)
+}
+
+/// e2fsck must report the image fully consistent.
+fn fsck_clean(img: &Path) {
+    let out = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(img)
+        .output()
+        .expect("e2fsck failed to spawn");
+    assert!(
+        out.status.success(),
+        "e2fsck -fn reported errors:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+fn reg_mode() -> u16 {
+    InodeFileType::S_IFREG.bits() | 0o644
 }
 
 /// Create a fresh, empty ext4 image at `block_size`. `tag` keeps parallel
@@ -458,4 +479,66 @@ fn synth_dirty_journal_layout_4k() {
     let s_start = u32::from_be_bytes([sb_block[28], sb_block[29], sb_block[30], sb_block[31]]);
     assert_eq!(s_start, j.sb.first);
     assert_eq!(s_sequence, seq);
+}
+
+#[test]
+fn recovering_open_clean_image_is_fsck_clean_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") {
+        eprintln!("skip");
+        return;
+    }
+    let img = fresh_image(4096, "jopenclean");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let _fs = Ext4::open_and_recover(dev).expect("open_and_recover");
+    fsck_clean(&img); // clean journal → recovery is a no-op → image still consistent
+}
+
+#[test]
+fn dirty_journal_recovered_change_visible_and_fsck_clean_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") {
+        eprintln!("skip");
+        return;
+    }
+    let img = fresh_image(4096, "jrecmount");
+    let bs = {
+        // 1) Create /f.bin with OLD content (one block) and find its data block P.
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        let bs = fs.block_size();
+        let f = fs.create(ROOT_INODE, "f.bin", reg_mode()).expect("create");
+        let old = vec![0x4F; bs]; // 'O'
+        fs.write_at(f.inode_num, 0, &old).expect("write old");
+        let ir = fs.get_inode_ref(f.inode_num);
+        let p = fs.get_pblock_idx(&ir, 0).expect("data block"); // physical block of logical 0
+        assert!(p != 0, "freshly-written file's data block was not allocated");
+
+        // 2) Synthesize a dirty journal logging NEW content into P.
+        let j = Journal::load(&fs).expect("load").expect("journal");
+        let base = j.sb.sequence;
+        let new = vec![0x4E; bs]; // 'N'
+        let txns = vec![SynthTxn {
+            sequence: base,
+            blocks: vec![(p, new.clone())],
+            revokes: vec![],
+        }];
+        stage_dirty_journal(&fs, &j, &txns);
+        bs
+    };
+
+    // 3) Open WITH recovery — replays NEW into P, clears the journal.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("open_and_recover");
+        // 4) The crate now reads NEW content from /f.bin.
+        let inode = fs
+            .generic_open("/f.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("open f");
+        let mut buf = vec![0u8; bs];
+        let n = fs.read_at(inode, 0, &mut buf).expect("read");
+        assert_eq!(n, bs);
+        assert_eq!(buf, vec![0x4E; bs], "recovered NEW content visible via crate");
+    }
+
+    // 5) e2fsck clean (journal was cleared by recovery; data block overwrite is consistent).
+    fsck_clean(&img);
 }

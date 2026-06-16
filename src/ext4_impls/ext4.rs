@@ -95,6 +95,17 @@ impl Ext4 {
         }
     }
 
+    /// Open the filesystem and run journal recovery if a dirty journal is present.
+    /// On a clean image (or one without a journal) this behaves like `open`.
+    /// This is the entry point a mounting caller (FUSE) should use.
+    pub fn open_and_recover(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
+        let fs = Ext4::open(block_device);
+        if let Some(journal) = crate::ext4_impls::journal::Journal::load(&fs)? {
+            journal.recover(&fs)?; // no-op when the journal is clean
+        }
+        Ok(fs)
+    }
+
     // with dir result search path offset
     pub fn generic_open(
         &self,
