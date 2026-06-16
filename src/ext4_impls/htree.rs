@@ -778,6 +778,20 @@ impl Ext4 {
         let root = Block::load(&self.block_device, p0 as usize * bs, bs);
         let count = dx_count(&root.data, eo) as usize;
         let levels = root.data[0x1e];
+
+        // Without the large_dir feature ext4 allows at most one indirect level
+        // (root → node → leaves); large_dir raises the cap to two.
+        const EXT4_FEATURE_INCOMPAT_LARGEDIR: u32 = 0x4000;
+        let max_levels =
+            if self.super_block.incompat_features() & EXT4_FEATURE_INCOMPAT_LARGEDIR != 0 {
+                2
+            } else {
+                1
+            };
+        if levels >= max_levels {
+            return_errno_with_message!(Errno::ENOSPC, "htree at max depth");
+        }
+
         let ents: Vec<(u32, u32)> = (0..count)
             .map(|i| {
                 let (h, b) = dx_get_entry(&root.data, eo, i);
