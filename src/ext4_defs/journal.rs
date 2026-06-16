@@ -154,6 +154,193 @@ impl JournalSuperblock {
     }
 }
 
+/// Which on-disk block-tag layout a journal uses, selected by its incompat
+/// feature flags.
+///
+/// - `V1` — `journal_block_tag_t` with a zero checksum field (true v1, no csum).
+/// - `V2` — `journal_block_tag_t` carrying the low 16 bits of the tag checksum
+///   (`JBD2_FEATURE_INCOMPAT_CSUM_V2`).
+/// - `V3` — `journal_block_tag3_t`, a wider layout with a full 32-bit checksum
+///   and an explicit 32-bit high-half block number
+///   (`JBD2_FEATURE_INCOMPAT_CSUM_V3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagFormat {
+    V1,
+    V2,
+    V3,
+}
+
+impl TagFormat {
+    /// Pick the tag layout from the journal's incompat feature flags.
+    ///
+    /// CSUM_V3 takes precedence over CSUM_V2 (the kernel never sets both
+    /// meaningfully, but if both bits appear, V3 is the wider/newer format).
+    pub fn from_features(feature_incompat: u32) -> Self {
+        if feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0 {
+            TagFormat::V3
+        } else if feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2 != 0 {
+            TagFormat::V2
+        } else {
+            TagFormat::V1
+        }
+    }
+}
+
+/// A single journal block tag (`journal_block_tag_t` / `journal_block_tag3_t`).
+///
+/// Inside a DESCRIPTOR block, after the 12-byte journal header, comes a run of
+/// these tags — one per data block that follows in the log. Each tag names the
+/// final on-disk location of the next logged block.
+///
+/// This struct holds the *logical* contents, independent of the three on-disk
+/// layouts; [`Self::emit`] / [`Self::parse`] handle the per-format field widths
+/// and big-endian encoding.
+///
+/// ## Trailing UUID
+/// On disk, each tag is *optionally* followed by a 16-byte UUID: it is present
+/// unless the tag's flags carry [`JBD2_FLAG_SAME_UUID`]. In practice the journal
+/// sets SAME_UUID on every tag except the first in a descriptor block, so only
+/// the first tag carries a UUID. This codec models the UUID's *presence* for
+/// length accounting only — it does not store or return the UUID bytes. On emit,
+/// 16 zero bytes are written as a placeholder when `!same_uuid`; the real UUID is
+/// filled in by the descriptor-block builder (Task 0.5+). On parse, the trailing
+/// UUID is skipped (and counted) when SAME_UUID is absent in the parsed flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockTag {
+    /// Full final block number (low | high combined into one value).
+    pub blocknr: u64,
+    /// Logical flags: ESCAPE / SAME_UUID / DELETED / LAST_TAG.
+    pub flags: u16,
+    /// Tag checksum. V3 uses the full 32 bits; V2 uses only the low 16 bits;
+    /// V1 has no checksum field on disk (always 0).
+    pub checksum: u32,
+}
+
+impl BlockTag {
+    /// Encode this tag into its on-disk bytes (big-endian), per `fmt`.
+    ///
+    /// Layouts (all big-endian):
+    /// - **V3** (`journal_block_tag3_t`, 16 bytes):
+    ///   `t_blocknr`(u32) @0, `t_flags`(u32) @4, `t_blocknr_high`(u32) @8,
+    ///   `t_checksum`(u32) @12. The high half is always written (the kernel
+    ///   writes 0 when not 64bit).
+    /// - **V1/V2** (`journal_block_tag_t`, 8 bytes, +4 if 64bit):
+    ///   `t_blocknr`(u32) @0, `t_checksum`(u16) @4, `t_flags`(u16) @6,
+    ///   and `t_blocknr_high`(u32) @8 only when `has_64bit`. V1 writes checksum
+    ///   0; V2 writes the low 16 bits of `self.checksum`.
+    ///
+    /// If `!same_uuid`, 16 placeholder (zero) UUID bytes are appended — see the
+    /// struct docs for why the real UUID is deferred to the descriptor builder.
+    pub fn emit(&self, fmt: TagFormat, has_64bit: bool, same_uuid: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        let lo = (self.blocknr & 0xFFFF_FFFF) as u32;
+        let hi = (self.blocknr >> 32) as u32;
+
+        match fmt {
+            TagFormat::V3 => {
+                buf.extend_from_slice(&lo.to_be_bytes()); // t_blocknr      @0
+                buf.extend_from_slice(&(self.flags as u32).to_be_bytes()); // t_flags @4
+                buf.extend_from_slice(&hi.to_be_bytes()); // t_blocknr_high @8 (always)
+                buf.extend_from_slice(&self.checksum.to_be_bytes()); // t_checksum @12
+            }
+            TagFormat::V1 | TagFormat::V2 => {
+                let csum16: u16 = match fmt {
+                    TagFormat::V1 => 0,
+                    _ => (self.checksum & 0xFFFF) as u16,
+                };
+                buf.extend_from_slice(&lo.to_be_bytes()); // t_blocknr   @0
+                buf.extend_from_slice(&csum16.to_be_bytes()); // t_checksum @4
+                buf.extend_from_slice(&self.flags.to_be_bytes()); // t_flags @6
+                if has_64bit {
+                    buf.extend_from_slice(&hi.to_be_bytes()); // t_blocknr_high @8
+                }
+            }
+        }
+
+        if !same_uuid {
+            // Placeholder UUID; the descriptor-block builder fills the real bytes.
+            buf.extend_from_slice(&[0u8; 16]);
+        }
+
+        buf
+    }
+
+    /// Parse a tag at the start of `buf`, returning the decoded tag and the TOTAL
+    /// number of bytes consumed — INCLUDING the trailing 16-byte UUID when the
+    /// parsed flags lack [`JBD2_FLAG_SAME_UUID`].
+    ///
+    /// Returns `Errno::EINVAL` if `buf` is too short for the selected layout (or
+    /// for the trailing UUID when one is expected), mirroring
+    /// [`JournalSuperblock::parse`]'s length guard so we never index out of range.
+    pub fn parse(buf: &[u8], fmt: TagFormat, has_64bit: bool) -> Result<(BlockTag, usize)> {
+        let be32 = |buf: &[u8], off: usize| -> u32 {
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+        };
+        let be16 = |buf: &[u8], off: usize| -> u16 {
+            u16::from_be_bytes([buf[off], buf[off + 1]])
+        };
+
+        // Base tag size (without trailing UUID).
+        let tag_len = match fmt {
+            TagFormat::V3 => 16,
+            TagFormat::V1 | TagFormat::V2 => {
+                if has_64bit {
+                    12
+                } else {
+                    8
+                }
+            }
+        };
+
+        if buf.len() < tag_len {
+            return_errno_with_message!(Errno::EINVAL, "journal block tag buffer too short");
+        }
+
+        let (blocknr, flags, checksum) = match fmt {
+            TagFormat::V3 => {
+                let lo = be32(buf, 0) as u64;
+                let flags = be32(buf, 4) as u16;
+                let hi = be32(buf, 8) as u64;
+                let checksum = be32(buf, 12);
+                ((hi << 32) | lo, flags, checksum)
+            }
+            TagFormat::V1 | TagFormat::V2 => {
+                let lo = be32(buf, 0) as u64;
+                let csum16 = be16(buf, 4);
+                let flags = be16(buf, 6);
+                let hi = if has_64bit { be32(buf, 8) as u64 } else { 0 };
+                let checksum = match fmt {
+                    TagFormat::V1 => 0,
+                    _ => csum16 as u32,
+                };
+                ((hi << 32) | lo, flags, checksum)
+            }
+        };
+
+        // A UUID trails the tag unless SAME_UUID is set in the parsed flags.
+        let mut consumed = tag_len;
+        if flags & JBD2_FLAG_SAME_UUID == 0 {
+            if buf.len() < tag_len + 16 {
+                return_errno_with_message!(
+                    Errno::EINVAL,
+                    "journal block tag buffer too short for trailing UUID"
+                );
+            }
+            consumed += 16;
+        }
+
+        Ok((
+            BlockTag {
+                blocknr,
+                flags,
+                checksum,
+            },
+            consumed,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +415,74 @@ mod tests {
         let mut b = vec![0u8; 64];
         b[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
         assert!(JournalSuperblock::parse(&b).is_err());
+    }
+
+    #[test]
+    fn block_tag_v3_roundtrip() {
+        // V3, 64bit: blocknr exercises the high half, SAME_UUID so no trailing UUID,
+        // and the full 32-bit checksum must survive the round-trip.
+        let tag = BlockTag {
+            blocknr: 0x1_2345_6789,
+            flags: JBD2_FLAG_SAME_UUID,
+            checksum: 0xDEAD_BEEF,
+        };
+        let bytes = tag.emit(TagFormat::V3, true, true);
+        // V3 tag is 16 bytes, no UUID because SAME_UUID is set.
+        assert_eq!(bytes.len(), 16);
+
+        let (parsed, consumed) = BlockTag::parse(&bytes, TagFormat::V3, true).unwrap();
+        assert_eq!(parsed, tag);
+        assert_eq!(consumed, bytes.len());
+        // The high half of the block number must survive.
+        assert_eq!(parsed.blocknr >> 32, 0x1);
+        assert_eq!(parsed.checksum, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn block_tag_v2_roundtrip() {
+        // V2, no 64bit: 8-byte tag, SAME_UUID, only low 16 bits of checksum survive.
+        let tag = BlockTag {
+            blocknr: 0x4242,
+            flags: JBD2_FLAG_SAME_UUID,
+            checksum: 0xBEEF,
+        };
+        let bytes = tag.emit(TagFormat::V2, false, true);
+        assert_eq!(bytes.len(), 8);
+
+        let (parsed, consumed) = BlockTag::parse(&bytes, TagFormat::V2, false).unwrap();
+        assert_eq!(parsed, tag);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(parsed.checksum, 0xBEEF);
+    }
+
+    #[test]
+    fn block_tag_v1_roundtrip() {
+        // V1, no 64bit: 8-byte tag. LAST_TAG (NOT same_uuid) so a 16-byte UUID trails.
+        // The v1 checksum field is always 0 on disk, so keep BlockTag.checksum == 0.
+        let tag = BlockTag {
+            blocknr: 0x99,
+            flags: JBD2_FLAG_LAST_TAG,
+            checksum: 0,
+        };
+        let bytes = tag.emit(TagFormat::V1, false, false);
+        assert_eq!(bytes.len(), 8 + 16);
+
+        let (parsed, consumed) = BlockTag::parse(&bytes, TagFormat::V1, false).unwrap();
+        assert_eq!(parsed, tag);
+        assert_eq!(consumed, 8 + 16);
+    }
+
+    #[test]
+    fn block_tag_format_selection() {
+        // V3 wins even if V2 is also set.
+        assert_eq!(
+            TagFormat::from_features(JBD2_FEATURE_INCOMPAT_CSUM_V3 | JBD2_FEATURE_INCOMPAT_CSUM_V2),
+            TagFormat::V3
+        );
+        assert_eq!(
+            TagFormat::from_features(JBD2_FEATURE_INCOMPAT_CSUM_V2),
+            TagFormat::V2
+        );
+        assert_eq!(TagFormat::from_features(0), TagFormat::V1);
     }
 }
