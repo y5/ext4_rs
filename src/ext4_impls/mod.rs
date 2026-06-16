@@ -7,6 +7,7 @@ pub mod file;
 pub mod htree;
 pub mod ialloc;
 pub mod inode;
+pub mod journal;
 pub mod xattr;
 
 pub use acl::*;
@@ -18,4 +19,5 @@ pub use file::*;
 pub use htree::*;
 pub use ialloc::*;
 pub use inode::*;
+pub use journal::*;
 pub use xattr::*;

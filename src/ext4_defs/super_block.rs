@@ -158,6 +158,12 @@ impl Ext4Superblock {
         self.features_compatible & EXT4_FEATURE_COMPAT_DIR_INDEX != 0
     }
 
+    /// Whether the `has_journal` compat feature is set (an ext4 journal exists).
+    pub fn has_feature_journal(&self) -> bool {
+        const EXT4_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+        self.features_compatible & EXT4_FEATURE_COMPAT_HAS_JOURNAL != 0
+    }
+
     /// Returns the number of inodes in each block group.
     pub fn inodes_per_group(&self) -> u32 {
         self.inodes_per_group

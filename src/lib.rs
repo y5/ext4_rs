@@ -16,6 +16,9 @@ mod ext4_impls;
 // HTree directory hashing + index helpers (publicly testable).
 pub use ext4_impls::htree::*;
 
+// Journal (jbd2) engine (publicly testable).
+pub use ext4_impls::journal::*;
+
 pub mod fuse_interface;
 pub mod simple_interface;
 
