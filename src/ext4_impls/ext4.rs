@@ -101,9 +101,13 @@ impl Ext4 {
     /// On a clean image (or one without a journal) this behaves like `open`.
     /// This is the entry point a mounting caller (FUSE) should use.
     pub fn open_and_recover(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
-        let fs = Ext4::open(block_device);
+        let mut fs = Ext4::open(block_device);
         if let Some(journal) = crate::ext4_impls::journal::Journal::load(&fs)? {
             journal.recover(&fs)?; // no-op when the journal is clean
+            // Recovery may have rewritten the on-disk superblock (replayed sb
+            // block, then cleared the RECOVER flag). Refresh the cached copy so it
+            // reflects the recovered, clean state rather than the dirty image.
+            fs.super_block = fs.read_super_block();
         }
         Ok(fs)
     }
@@ -118,6 +122,9 @@ impl Ext4 {
         let mut fs = Ext4::open(jdev.clone()); // block_device = jdev (inactive → passthrough)
         if let Some(journal) = Journal::load(&fs)? {
             journal.recover(&fs)?; // replay a dirty journal (jdev passthrough)
+            // Recovery may have rewritten the superblock (replayed sb block, then
+            // cleared RECOVER); refresh the cached copy to the recovered state.
+            fs.super_block = fs.read_super_block();
             fs.journal = Some(journal);
             fs.journal_device = Some(jdev);
         }

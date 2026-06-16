@@ -104,7 +104,44 @@ pub struct Ext4Superblock {
     checksum: u32,             // crc32c(superblock)
 }
 
+/// `EXT4_FEATURE_INCOMPAT_RECOVER` (`features_incompatible` bit): the journal
+/// has committed-but-un-checkpointed data and the fs must be recovered before
+/// it is consistent. A kernel mount / e2fsck replays the journal when this is set.
+pub const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
+
+/// Byte offset of `s_feature_incompat` within the on-disk superblock (verified
+/// against the repr-C struct layout: 0x60).
+const SB_FEATURE_INCOMPAT_OFF: usize = 0x60;
+/// Byte offset of `s_checksum` within the on-disk superblock.
+const SB_CHECKSUM_OFF: usize = 0x3fc;
+
 impl Ext4Superblock {
+    /// Set/clear the RECOVER flag inside a raw block buffer that holds the ext4
+    /// superblock at intra-block offset `sb_off`, then fix the superblock
+    /// checksum. Used to patch the journaled (staged) copy of the superblock
+    /// block so a crash mid-checkpoint leaves RECOVER consistent with the dirty
+    /// journal. The checksum is recomputed exactly as `sync_to_disk_with_csum`:
+    /// `crc32c(EXT4_CRC32_INIT, &sb_bytes[..0x3fc], 0x3fc)`, stored little-endian
+    /// at `sb_off + 0x3fc`.
+    pub fn patch_recover_in_block(block: &mut [u8], sb_off: usize, on: bool) {
+        // Read/modify the incompat-feature word in place.
+        let fo = sb_off + SB_FEATURE_INCOMPAT_OFF;
+        let mut feat = u32::from_le_bytes([block[fo], block[fo + 1], block[fo + 2], block[fo + 3]]);
+        if on {
+            feat |= EXT4_FEATURE_INCOMPAT_RECOVER;
+        } else {
+            feat &= !EXT4_FEATURE_INCOMPAT_RECOVER;
+        }
+        block[fo..fo + 4].copy_from_slice(&feat.to_le_bytes());
+
+        // Recompute the superblock checksum over the first 0x3fc bytes of the sb
+        // region and store it little-endian at sb_off + 0x3fc.
+        let sb_bytes = &block[sb_off..sb_off + SB_CHECKSUM_OFF];
+        let csum = ext4_crc32c(EXT4_CRC32_INIT, sb_bytes, SB_CHECKSUM_OFF as u32);
+        let co = sb_off + SB_CHECKSUM_OFF;
+        block[co..co + 4].copy_from_slice(&csum.to_le_bytes());
+    }
+
     /// Returns the size of inode structure.
     pub fn inode_size(&self) -> u16 {
         self.inode_size
@@ -261,6 +298,21 @@ impl Ext4Superblock {
 
     pub fn incompat_features(&self) -> u32 {
         self.features_incompatible
+    }
+
+    /// Whether the RECOVER incompat flag is set (journal has data needing replay).
+    pub fn needs_recovery(&self) -> bool {
+        self.features_incompatible & EXT4_FEATURE_INCOMPAT_RECOVER != 0
+    }
+
+    /// Set or clear the RECOVER incompat flag in memory. The caller must
+    /// `sync_to_disk_with_csum` to persist (so the checksum stays valid).
+    pub fn set_needs_recovery(&mut self, on: bool) {
+        if on {
+            self.features_incompatible |= EXT4_FEATURE_INCOMPAT_RECOVER;
+        } else {
+            self.features_incompatible &= !EXT4_FEATURE_INCOMPAT_RECOVER;
+        }
     }
 
     pub fn reserved_gdt_blocks(&self) -> u16 {

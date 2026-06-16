@@ -1301,3 +1301,123 @@ fn crash_before_checkpoint_recovers_2k() {
 fn crash_before_checkpoint_recovers_4k() {
     crash_before_checkpoint_recovers(4096);
 }
+
+// ---------------------------------------------------------------------------
+// Task 7.2: ext4 RECOVER (needs_recovery) incompat flag.
+//
+// While the journal is dirty (committed-but-un-checkpointed txn), the ext4
+// superblock's EXT4_FEATURE_INCOMPAT_RECOVER bit (0x0004 in features_incompat)
+// must be SET so a kernel/e2fsck knows the image needs recovery. It is cleared
+// after a full commit (checkpoint complete) and after recovery.
+// ---------------------------------------------------------------------------
+
+const EXT4_INCOMPAT_RECOVER: u32 = 0x0004;
+
+#[test]
+fn dirty_journal_sets_recover_flag_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jrecflag");
+    // Emit a dirty journal: journaled write, crash before checkpoint.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "r.bin", reg_mode()).expect("create");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.write_at(f.inode_num, 0, &vec![0x5Au8; 4096]).expect("write");
+    }
+    // While dirty, RECOVER must be SET on the on-disk superblock.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        assert!(
+            fs.super_block.needs_recovery(),
+            "RECOVER must be set while the journal is dirty"
+        );
+        assert_eq!(fs.super_block.incompat_features() & EXT4_INCOMPAT_RECOVER, EXT4_INCOMPAT_RECOVER);
+    }
+    // Recovery clears RECOVER and leaves the image clean.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("recover");
+        assert!(
+            !fs.super_block.needs_recovery(),
+            "RECOVER must be cleared after recovery"
+        );
+        // Re-read fresh from disk to be sure it persisted.
+        let dev2: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs2 = Ext4::open(dev2);
+        assert!(!fs2.super_block.needs_recovery(), "RECOVER persisted clear");
+    }
+    fsck_clean(&img);
+}
+
+#[test]
+fn recover_flag_clear_after_full_commit_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jrecclean");
+    // A FULL commit (no crash): write is committed + checkpointed, journal clean.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "c.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &vec![0x11u8; 4096]).expect("write");
+    }
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open(dev);
+        assert!(
+            !fs.super_block.needs_recovery(),
+            "RECOVER must be clear after a full (checkpointed) commit"
+        );
+        assert_eq!(Journal::load(&fs).unwrap().unwrap().sb.start, 0, "journal clean");
+    }
+    fsck_clean(&img);
+}
+
+/// STRONGEST: with RECOVER correctly set, e2fsck recognizes the dirty image
+/// needs recovery WITHOUT the "needs_recovery flag is clear" warning, replays
+/// the journal, and a follow-up check is clean.
+#[test]
+fn e2fsck_recovers_dirty_image_without_warning_4k() {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jrecwarn");
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_journaled(dev).expect("open_journaled");
+        let f = fs.create(ROOT_INODE, "w.bin", reg_mode()).expect("create");
+        fs.journal_device.as_ref().unwrap().set_crash(CrashPoint::AfterCommitBlock);
+        fs.write_at(f.inode_num, 0, &vec![0x5Au8; 4096]).expect("write");
+    }
+    // Replay on a COPY (e2fsck -fy mutates the image).
+    let copy = img.with_extension("recwarn.img");
+    fs::copy(&img, &copy).expect("copy image");
+    let replay = Command::new("e2fsck")
+        .args(["-fy"])
+        .arg(&copy)
+        .output()
+        .expect("e2fsck spawn");
+    let replay_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        replay_text.contains("recovering journal"),
+        "e2fsck did not recover our journal:\n{replay_text}"
+    );
+    assert!(
+        !replay_text.contains("needs_recovery flag is clear"),
+        "e2fsck warned that needs_recovery is clear (RECOVER not set):\n{replay_text}"
+    );
+    let recheck = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(&copy)
+        .output()
+        .expect("e2fsck recheck spawn");
+    assert!(
+        recheck.status.success(),
+        "e2fsck -fn not clean after replay:\n{}{}",
+        String::from_utf8_lossy(&recheck.stdout),
+        String::from_utf8_lossy(&recheck.stderr)
+    );
+}

@@ -318,6 +318,30 @@ impl Journal {
         let maxlen = ctx.sb.maxlen;
         let seq = txn.sequence;
 
+        // 2b. Build the set of blocks to journal + checkpoint. This is the staged
+        // blocks plus a guaranteed copy of the ext4-superblock block with the
+        // RECOVER incompat flag SET (and a corrected sb checksum). The superblock
+        // is itself a journaled block: it gets CHECKPOINTED to its final location,
+        // and a MidCheckpoint crash can write it (a low block number) before the
+        // journal is cleared. If the staged sb had RECOVER clear, that crash would
+        // leave RECOVER clear on disk while the journal is still dirty (a kernel
+        // would NOT auto-recover). So we patch RECOVER ON in the staged sb copy,
+        // adding it from disk if this txn didn't already stage it.
+        let sb_block_idx = (1024 / bs) as u64;
+        let sb_off = 1024 % bs;
+        // BTreeMap keeps the journal/checkpoint order deterministic (sorted by
+        // final block number), matching the previous direct iteration of txn.blocks.
+        let mut journaled: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for (final_block, staged) in &txn.blocks {
+            journaled.insert(*final_block, staged.data.clone());
+        }
+        {
+            let buf = journaled.entry(sb_block_idx).or_insert_with(|| {
+                fs.block_device.read_offset(sb_block_idx as usize * bs, bs)
+            });
+            Ext4Superblock::patch_recover_in_block(buf, sb_off, true);
+        }
+
         // A log cursor that wraps back to `first` once it reaches the end of the
         // journal area, mirroring the SCAN walk.
         // this engine commits one txn at a time; the log always starts at s_first
@@ -333,13 +357,13 @@ impl Journal {
         // block (BTreeMap → sorted by final block number) build a tag, handling the
         // ESCAPE case (logged copy zeroes the leading magic; tag flags ESCAPE).
         let magic_be = JBD2_MAGIC_NUMBER.to_be_bytes();
-        let mut tags: Vec<BlockTag> = Vec::with_capacity(txn.blocks.len());
+        let mut tags: Vec<BlockTag> = Vec::with_capacity(journaled.len());
         // Logged copies are the (possibly escaped) block bodies we write to the log.
-        let mut logged_copies: Vec<Vec<u8>> = Vec::with_capacity(txn.blocks.len());
-        for (final_block, staged) in &txn.blocks {
+        let mut logged_copies: Vec<Vec<u8>> = Vec::with_capacity(journaled.len());
+        for (final_block, data) in &journaled {
             let mut flags: u16 = 0;
-            let mut logged = staged.data.clone();
-            if staged.data.len() >= 4 && staged.data[0..4] == magic_be[..] {
+            let mut logged = data.clone();
+            if data.len() >= 4 && data[0..4] == magic_be[..] {
                 flags |= JBD2_FLAG_ESCAPE;
                 logged[0..4].copy_from_slice(&[0u8; 4]);
             }
@@ -421,6 +445,20 @@ impl Journal {
         advance(&mut cursor);
         fs.block_device.flush();
 
+        // 6b. The journal is now durably dirty (a committed, un-checkpointed txn).
+        // Set the ext4 RECOVER incompat flag on the LIVE on-disk superblock so any
+        // crash in the commit→checkpoint window leaves RECOVER set on disk — a
+        // kernel/e2fsck then knows the image needs recovery (without the
+        // "needs_recovery flag is clear" warning). The staged sb copy (patched
+        // above) covers the MidCheckpoint case where the sb is checkpointed early;
+        // this covers the AfterCommitBlock / pre-checkpoint case where the live sb
+        // is otherwise never touched. Cleared in step 8b on a full commit, and by
+        // recover() after replay.
+        let mut ext4_sb = fs.read_super_block();
+        ext4_sb.set_needs_recovery(true);
+        ext4_sb.sync_to_disk_with_csum(&fs.block_device);
+        fs.block_device.flush();
+
         // Crash injection: stop here, after the commit block is durable but before
         // any checkpoint. The journal is dirty with a committed txn → recovery must
         // replay it on the next mount.
@@ -431,7 +469,7 @@ impl Journal {
         // 7. Checkpoint: write the ORIGINAL (un-escaped) data to each block's final
         // on-disk location, then flush so the checkpoint is durable before we mark
         // the journal clean.
-        for (i, (final_block, staged)) in txn.blocks.iter().enumerate() {
+        for (i, (final_block, data)) in journaled.iter().enumerate() {
             // Crash injection: checkpoint only the first `n` blocks then stop,
             // leaving the journal still dirty (the mark-clean in step 8 never runs).
             if let CrashPoint::MidCheckpoint(n) = crash {
@@ -440,7 +478,7 @@ impl Journal {
                 }
             }
             fs.block_device
-                .write_offset(*final_block as usize * bs, &staged.data);
+                .write_offset(*final_block as usize * bs, data);
         }
         fs.block_device.flush();
 
@@ -449,6 +487,16 @@ impl Journal {
         let mut sb_block = self.read_log_block(fs, 0)?;
         patch_journal_sb_head(&mut sb_block, seq.wrapping_add(1), 0);
         self.write_log_block(fs, 0, &sb_block)?;
+        fs.block_device.flush();
+
+        // 8b. Clear the ext4 RECOVER flag on the LIVE superblock: the journal is
+        // now clean (the staged sb with RECOVER set was just checkpointed, so the
+        // on-disk sb currently has RECOVER set + correct free counts). Reading the
+        // live sb picks up those checkpointed free counts; we clear RECOVER and
+        // sync with a fresh checksum, leaving a clean, consistent superblock.
+        let mut ext4_sb = fs.read_super_block();
+        ext4_sb.set_needs_recovery(false);
+        ext4_sb.sync_to_disk_with_csum(&fs.block_device);
         fs.block_device.flush();
 
         // 9. Done.
@@ -528,6 +576,15 @@ impl Journal {
         let mut sb_block = self.read_log_block(fs, 0)?;
         patch_journal_sb_head(&mut sb_block, scan.last_sequence.wrapping_add(1), 0);
         self.write_log_block(fs, 0, &sb_block)?;
+        fs.block_device.flush();
+
+        // The image is now recovered and clean: clear the ext4 RECOVER incompat
+        // flag on the live superblock (replay may have checkpointed a sb with
+        // RECOVER set) and re-checksum it. Reading the live sb first preserves the
+        // replayed free counts.
+        let mut ext4_sb = fs.read_super_block();
+        ext4_sb.set_needs_recovery(false);
+        ext4_sb.sync_to_disk_with_csum(&fs.block_device);
         fs.block_device.flush();
         Ok(())
     }
