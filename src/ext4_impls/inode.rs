@@ -244,7 +244,8 @@ impl Ext4 {
             DirEntryType::EXT4_DE_FIFO => InodeFileType::S_IFIFO.bits(),
             DirEntryType::EXT4_DE_SOCK => InodeFileType::S_IFSOCK.bits(),
             _ => {
-                // FIXME: unsupported filetype
+                // EXT4_DE_UNKNOWN or any out-of-range byte: no inode format
+                // corresponds to it, so fall back to a regular file.
                 InodeFileType::S_IFREG.bits()
             }
         }

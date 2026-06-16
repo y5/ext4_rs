@@ -145,7 +145,8 @@ impl Ext4 {
         if r.is_ok() {
             return_errno!(Errno::EEXIST);
         }
-        let inode_ref = self.create(parent as u32, name, mode as u16)?;
+        let inode_ref =
+            self.create_special_with_attr(parent as u32, name, mode as u16, rdev, 0, 0)?;
         Ok(inode_ref)
     }
 
@@ -165,8 +166,14 @@ impl Ext4 {
         if r.is_ok() {
             return_errno!(Errno::EEXIST);
         }
-        let inode_ref =
-            self.create_with_attr(parent as u32, name, mode as u16, uid as u16, gid as u16)?;
+        let inode_ref = self.create_special_with_attr(
+            parent as u32,
+            name,
+            mode as u16,
+            rdev,
+            uid as u16,
+            gid as u16,
+        )?;
         Ok(inode_ref)
     }
 

@@ -84,6 +84,12 @@ impl Ext4 {
     }
 
     pub fn create_inode(&self, inode_mode: u16) -> Result<Ext4InodeRef> {
+        self.create_inode_with_rdev(inode_mode, 0)
+    }
+
+    /// Allocate and initialize an inode. `rdev` is the packed device number for
+    /// char/block device nodes (ignored for every other type).
+    pub fn create_inode_with_rdev(&self, inode_mode: u16, rdev: u32) -> Result<Ext4InodeRef> {
         // `inode_mode` may carry only the format bits (e.g. S_IFDIR for an
         // intermediate path component), only permission bits (e.g. 0o644 from a
         // path-based file create), or both. Pull the format from the high bits
@@ -121,9 +127,21 @@ impl Ext4 {
             inode.set_i_extra_isize(extra_size);
         }
 
-        // set extent
-        inode.set_flags(EXT4_INODE_FLAG_EXTENTS as u32);
-        inode.extent_tree_init();
+        // Special files (char/block device, FIFO, socket) store no file data,
+        // so they carry no extent tree: e2fsck rejects a special inode that has
+        // the EXTENTS flag set. Char/block devices keep their device number in
+        // i_block instead. Everything else (regular, directory, symlink) is
+        // extent-mapped.
+        match inode_file_type {
+            InodeFileType::S_IFCHR | InodeFileType::S_IFBLK => {
+                inode.set_device(rdev);
+            }
+            InodeFileType::S_IFIFO | InodeFileType::S_IFSOCK => {}
+            _ => {
+                inode.set_flags(EXT4_INODE_FLAG_EXTENTS as u32);
+                inode.extent_tree_init();
+            }
+        }
 
         let inode_ref = Ext4InodeRef { inode_num, inode };
 
@@ -152,6 +170,38 @@ impl Ext4 {
 
         // let mut child_inode_ref = self.create_inode(inode_mode)?;
         let mut init_child_ref = self.create_inode(inode_mode)?;
+
+        init_child_ref.inode.set_uid(uid);
+        init_child_ref.inode.set_gid(gid);
+
+        self.write_back_inode_without_csum(&init_child_ref);
+        // load new
+        let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
+
+        self.link(&mut parent_inode_ref, &mut child_inode_ref, name)?;
+
+        self.write_back_inode(&mut parent_inode_ref);
+        self.write_back_inode(&mut child_inode_ref);
+
+        Ok(child_inode_ref)
+    }
+
+    /// Create a special file (char/block device, FIFO, socket) and link it into
+    /// the parent. `rdev` is the packed device number, used only for device
+    /// nodes. Mirrors `create_with_attr` but routes through the device-aware
+    /// inode initializer.
+    pub fn create_special_with_attr(
+        &self,
+        parent: u32,
+        name: &str,
+        inode_mode: u16,
+        rdev: u32,
+        uid: u16,
+        gid: u16,
+    ) -> Result<Ext4InodeRef> {
+        let mut parent_inode_ref = self.get_inode_ref(parent);
+
+        let mut init_child_ref = self.create_inode_with_rdev(inode_mode, rdev)?;
 
         init_child_ref.inode.set_uid(uid);
         init_child_ref.inode.set_gid(gid);

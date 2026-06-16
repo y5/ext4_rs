@@ -181,6 +181,26 @@ impl Ext4Inode {
         self.block = block;
     }
 
+    /// Store a device number for a char/block device node in `i_block`.
+    ///
+    /// `rdev` is the `new_encode_dev`-packed value the kernel hands a FUSE
+    /// server. ext4 keeps small numbers (`old_valid_dev`: both major and minor
+    /// < 256) in `i_block[0]` using the old encoding, and larger ones in
+    /// `i_block[1]` using the new encoding — matching `fs/ext4/inode.c`. For
+    /// small numbers `new_encode_dev` already equals `old_encode_dev`, so the
+    /// stored word is just `rdev` in either slot.
+    pub fn set_device(&mut self, rdev: u32) {
+        let major = (rdev >> 8) & 0xfff;
+        let minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00);
+        if major < 256 && minor < 256 {
+            self.block[0] = rdev;
+            self.block[1] = 0;
+        } else {
+            self.block[0] = 0;
+            self.block[1] = rdev;
+        }
+    }
+
     pub fn generation(&self) -> u32 {
         self.generation
     }

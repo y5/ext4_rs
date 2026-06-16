@@ -1579,3 +1579,113 @@ fn xattr_ea_inode_1k() {
 fn xattr_ea_inode_4k() {
     xattr_ea_inode(4096);
 }
+
+// --- mknod: special file types (char/block device, FIFO, socket) ---
+
+/// `new_encode_dev`-style packing of a (major, minor) pair, matching what the
+/// kernel hands a FUSE server as `rdev`. For small numbers this collapses to
+/// `(major << 8) | minor`.
+fn mkdev(major: u32, minor: u32) -> u32 {
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
+/// Create char/block/FIFO/socket nodes through the crate's mknod path. e2fsck
+/// must stay clean (special files carry no extent tree), and debugfs must report
+/// the right type for each — and the right device major/minor for the device
+/// nodes (whose number is stored in i_block, not discarded).
+fn mknod_special(block_size: u32) {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image(block_size, "mknod");
+
+    // /dev/null is char 1:3; a block device 8:0 (sda-like).
+    let cdev = mkdev(1, 3);
+    let bdev = mkdev(8, 0);
+
+    {
+        let ext4 = open_fs(&img);
+        ext4.fuse_mknod_with_attr(
+            ROOT_INODE as u64,
+            "cdev",
+            InodeFileType::S_IFCHR.bits() as u32 | 0o644,
+            0,
+            cdev,
+            0,
+            0,
+        )
+        .expect("mknod cdev");
+        ext4.fuse_mknod_with_attr(
+            ROOT_INODE as u64,
+            "bdev",
+            InodeFileType::S_IFBLK.bits() as u32 | 0o644,
+            0,
+            bdev,
+            0,
+            0,
+        )
+        .expect("mknod bdev");
+        ext4.fuse_mknod_with_attr(
+            ROOT_INODE as u64,
+            "fifo",
+            InodeFileType::S_IFIFO.bits() as u32 | 0o644,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("mknod fifo");
+        ext4.fuse_mknod_with_attr(
+            ROOT_INODE as u64,
+            "sock",
+            InodeFileType::S_IFSOCK.bits() as u32 | 0o644,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("mknod sock");
+    }
+    fsck_clean(&img);
+
+    let cdev_stat = debugfs(&img, "stat /cdev");
+    assert!(
+        cdev_stat.contains("character special"),
+        "cdev wrong type @ {block_size}:\n{cdev_stat}"
+    );
+    assert!(
+        cdev_stat.contains("Device major/minor number: 01:03"),
+        "cdev wrong device number @ {block_size}:\n{cdev_stat}"
+    );
+
+    let bdev_stat = debugfs(&img, "stat /bdev");
+    assert!(
+        bdev_stat.contains("block special"),
+        "bdev wrong type @ {block_size}:\n{bdev_stat}"
+    );
+    assert!(
+        bdev_stat.contains("Device major/minor number: 08:00"),
+        "bdev wrong device number @ {block_size}:\n{bdev_stat}"
+    );
+
+    let fifo_stat = debugfs(&img, "stat /fifo");
+    assert!(
+        fifo_stat.contains("FIFO"),
+        "fifo wrong type @ {block_size}:\n{fifo_stat}"
+    );
+
+    let sock_stat = debugfs(&img, "stat /sock");
+    assert!(
+        sock_stat.contains("socket"),
+        "sock wrong type @ {block_size}:\n{sock_stat}"
+    );
+}
+
+#[test]
+fn mknod_special_1k() {
+    mknod_special(1024);
+}
+#[test]
+fn mknod_special_4k() {
+    mknod_special(4096);
+}
