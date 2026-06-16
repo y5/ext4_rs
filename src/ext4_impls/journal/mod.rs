@@ -27,6 +27,19 @@ pub use crate::ext4_defs::journal::{
     JBD2_REVOKE_BLOCK,
 };
 
+/// Where to simulate a crash during commit, for crash-recovery testing.
+/// `None` is a full commit. `AfterCommitBlock` stops right after the commit
+/// block is durable (steps 1-6), leaving the journal dirty with a committed but
+/// un-checkpointed transaction — exactly what recovery must replay.
+/// `MidCheckpoint(n)` checkpoints only the first `n` blocks then stops (for
+/// idempotency testing in Task 4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashPoint {
+    None,
+    AfterCommitBlock,
+    MidCheckpoint(usize),
+}
+
 /// One block logged by a committed transaction: its final on-disk location and
 /// the log block holding its data, plus tag flags (ESCAPE handling at replay).
 pub struct LoggedBlock {
@@ -263,6 +276,22 @@ impl Journal {
     /// transactions are small. If the tags would overflow one block, commit
     /// returns `ENOSPC` rather than silently corrupting the log.
     pub fn commit(&self, fs: &Ext4, txn: &Transaction) -> Result<()> {
+        self.commit_with_crash(fs, txn, CrashPoint::None)
+    }
+
+    /// Commit `txn`, optionally simulating a crash partway through (for crash-
+    /// recovery tests). `CrashPoint::None` is a full commit (steps 1-8) and is
+    /// exactly what `commit` does. `AfterCommitBlock` runs steps 1-6 then stops,
+    /// leaving the journal dirty with a committed-but-un-checkpointed txn —
+    /// precisely what recovery must replay. `MidCheckpoint(n)` checkpoints only
+    /// the first `n` blocks then stops, leaving the journal still dirty (for
+    /// idempotency testing).
+    pub fn commit_with_crash(
+        &self,
+        fs: &Ext4,
+        txn: &Transaction,
+        crash: CrashPoint,
+    ) -> Result<()> {
         // 1. Empty transaction → nothing to do.
         if txn.is_empty() {
             return Ok(());
@@ -384,10 +413,24 @@ impl Journal {
         advance(&mut cursor);
         fs.block_device.flush();
 
+        // Crash injection: stop here, after the commit block is durable but before
+        // any checkpoint. The journal is dirty with a committed txn → recovery must
+        // replay it on the next mount.
+        if crash == CrashPoint::AfterCommitBlock {
+            return Ok(());
+        }
+
         // 7. Checkpoint: write the ORIGINAL (un-escaped) data to each block's final
         // on-disk location, then flush so the checkpoint is durable before we mark
         // the journal clean.
-        for (final_block, staged) in &txn.blocks {
+        for (i, (final_block, staged)) in txn.blocks.iter().enumerate() {
+            // Crash injection: checkpoint only the first `n` blocks then stop,
+            // leaving the journal still dirty (the mark-clean in step 8 never runs).
+            if let CrashPoint::MidCheckpoint(n) = crash {
+                if i >= n {
+                    return Ok(());
+                }
+            }
             fs.block_device
                 .write_offset(*final_block as usize * bs, &staged.data);
         }

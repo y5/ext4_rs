@@ -12,7 +12,8 @@ use std::sync::Arc;
 use ext4_rs::{
     assemble_descriptor_block, finalize_commit_csum, finalize_revoke_csum, jbd2_csum_seed,
     jbd2_data_block_csum, parse_descriptor_block, patch_journal_sb_head, verify_commit_csum,
-    BlockDevice, BlockTag, CommitBlock, Ext4, InodeFileType, Journal, JournalDevice, RevokeBlock,
+    BlockDevice, BlockTag, CommitBlock, CrashPoint, Ext4, InodeFileType, Journal, JournalDevice,
+    RevokeBlock,
     TagFormat, JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2,
     JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FLAG_LAST_TAG,
 };
@@ -580,4 +581,66 @@ fn dirty_journal_recovered_change_visible_and_fsck_clean_4k() {
 
     // 5) e2fsck clean (journal was cleared by recovery; data block overwrite is consistent).
     fsck_clean(&img);
+}
+
+/// The core crash-recovery round-trip: a txn durably committed to the journal but
+/// NOT yet checkpointed must be fully replayed by recovery on the next mount,
+/// yielding a consistent (e2fsck-clean) fs with the change visible. Parameterized
+/// over block size.
+fn crash_before_checkpoint_recovers(block_size: u32) {
+    if tool_missing("mkfs.ext4") || tool_missing("e2fsck") {
+        eprintln!("skip");
+        return;
+    }
+    let img = fresh_image(block_size, "jcrash");
+    let content = vec![0x3C_u8; block_size as usize];
+
+    // 1) Capture a file create+write in a txn, then COMMIT but CRASH before checkpoint.
+    {
+        let file_dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let jdev = Arc::new(JournalDevice::new(file_dev.clone(), block_size as usize));
+        let fs = Ext4::open(jdev.clone());
+        let journal = Journal::load(&fs).expect("load").expect("journal");
+        jdev.begin(journal.sb.sequence);
+        let f = fs.create(ROOT_INODE, "crash.bin", reg_mode()).expect("create");
+        fs.write_at(f.inode_num, 0, &content).expect("write");
+        let txn = jdev.end().expect("txn");
+        journal
+            .commit_with_crash(&fs, &txn, CrashPoint::AfterCommitBlock)
+            .expect("commit-crash");
+        // The inner image does NOT have the file yet (no checkpoint); the journal is dirty.
+    }
+
+    // 2) Reopen WITH recovery — replays the committed txn into the fs.
+    {
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+        let fs = Ext4::open_and_recover(dev).expect("open_and_recover");
+        let ino = fs
+            .generic_open("/crash.bin", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+            .expect("open");
+        let mut buf = vec![0u8; content.len()];
+        let n = fs.read_at(ino, 0, &mut buf).expect("read");
+        assert_eq!(n, content.len());
+        assert_eq!(buf, content, "recovered file content after crash-before-checkpoint");
+        let j = Journal::load(&fs).expect("load").expect("journal");
+        assert_eq!(j.sb.start, 0, "journal cleared after recovery");
+    }
+
+    // 3) e2fsck clean: recovery produced a consistent fs.
+    fsck_clean(&img);
+}
+
+#[test]
+fn crash_before_checkpoint_recovers_1k() {
+    crash_before_checkpoint_recovers(1024);
+}
+
+#[test]
+fn crash_before_checkpoint_recovers_2k() {
+    crash_before_checkpoint_recovers(2048);
+}
+
+#[test]
+fn crash_before_checkpoint_recovers_4k() {
+    crash_before_checkpoint_recovers(4096);
 }
