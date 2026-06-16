@@ -426,6 +426,95 @@ impl CommitBlock {
     }
 }
 
+/// A jbd2 revoke block (`jbd2_journal_revoke_header_t` + packed block array),
+/// big-endian on disk.
+///
+/// A revoke block lists block numbers whose journalled copies must NOT be
+/// replayed during recovery (because they were later reused/freed). On-disk
+/// layout:
+///   0..12  journal_header_t (h_blocktype = `JBD2_REVOKE_BLOCK`)
+///   12..16 r_count (u32 BE) — number of BYTES used, INCLUDING the 16-byte
+///          header. Never counts the trailing CSUM_V2/V3 block checksum.
+///   16..   packed array of revoked block numbers: each u32 BE, or u64 BE when
+///          the journal carries the 64BIT feature.
+///
+/// Under CSUM_V2/V3 a 4-byte block checksum occupies the block's last 4 bytes;
+/// this codec leaves that region zero (a later task fills it) and `r_count`
+/// never extends into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeBlock {
+    /// h_sequence — the transaction's commit ID.
+    pub sequence: u32,
+    /// The revoked block numbers (always returned widened to u64).
+    pub blocks: Vec<u64>,
+}
+
+impl RevokeBlock {
+    /// Encode this revoke block into a fresh, zeroed `block_size`-byte block
+    /// (big-endian). Entries are u64 when `has_64bit`, else u32. `r_count` is set
+    /// to header + array bytes only (never the trailing checksum region).
+    pub fn emit(&self, block_size: usize, has_64bit: bool) -> Vec<u8> {
+        let entry_size = if has_64bit { 8 } else { 4 };
+        let mut buf = vec![0u8; block_size];
+        put_be32(&mut buf, 0, JBD2_MAGIC_NUMBER); // h_magic
+        put_be32(&mut buf, 4, JBD2_REVOKE_BLOCK); // h_blocktype
+        put_be32(&mut buf, 8, self.sequence); // h_sequence
+
+        let mut off = 16;
+        for &blk in &self.blocks {
+            if has_64bit {
+                put_be64(&mut buf, off, blk);
+            } else {
+                put_be32(&mut buf, off, blk as u32);
+            }
+            off += entry_size;
+        }
+        // r_count = 16-byte header + array bytes only.
+        put_be32(&mut buf, 12, off as u32); // r_count
+        buf
+    }
+
+    /// Decode a revoke block from a raw block buffer (big-endian). Entry width is
+    /// keyed by `has_64bit`. Block numbers are returned widened to u64.
+    ///
+    /// Returns `Errno::EINVAL` if the buffer is too short, the magic is wrong, the
+    /// blocktype is not `JBD2_REVOKE_BLOCK`, or `r_count` exceeds the buffer.
+    pub fn parse(buf: &[u8], has_64bit: bool) -> Result<Self> {
+        // Need through r_count@12..16.
+        if buf.len() < 16 {
+            return_errno_with_message!(Errno::EINVAL, "journal revoke block buffer too short");
+        }
+        if be32(buf, 0) != JBD2_MAGIC_NUMBER {
+            return_errno_with_message!(Errno::EINVAL, "bad jbd2 revoke block magic");
+        }
+        if be32(buf, 4) != JBD2_REVOKE_BLOCK {
+            return_errno_with_message!(Errno::EINVAL, "journal block is not a revoke block");
+        }
+
+        let sequence = be32(buf, 8);
+        let r_count = be32(buf, 12) as usize;
+        if r_count > buf.len() {
+            return_errno_with_message!(Errno::EINVAL, "journal revoke r_count exceeds buffer");
+        }
+
+        let entry_size = if has_64bit { 8 } else { 4 };
+        let mut blocks = Vec::new();
+        let mut off = 16;
+        // Only read whole entries that fit entirely within r_count.
+        while off + entry_size <= r_count {
+            let blk = if has_64bit {
+                be64(buf, off)
+            } else {
+                be32(buf, off) as u64
+            };
+            blocks.push(blk);
+            off += entry_size;
+        }
+
+        Ok(RevokeBlock { sequence, blocks })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +674,54 @@ mod tests {
         // Overwrite h_blocktype@4 with a non-commit blocktype.
         bytes[4..8].copy_from_slice(&JBD2_REVOKE_BLOCK.to_be_bytes());
         assert!(CommitBlock::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn revoke_block_roundtrip_32() {
+        let rb = RevokeBlock {
+            sequence: 3,
+            blocks: vec![0x10, 0x20, 0x3FFF],
+        };
+        let bytes = rb.emit(1024, false);
+        assert_eq!(bytes.len(), 1024);
+        assert_eq!(&bytes[0..4], &JBD2_MAGIC_NUMBER.to_be_bytes());
+        assert_eq!(&bytes[4..8], &JBD2_REVOKE_BLOCK.to_be_bytes());
+        // r_count @12 = 16-byte header + 3 entries * 4 bytes.
+        assert_eq!(be32(&bytes, 12), 16 + 3 * 4);
+
+        let parsed = RevokeBlock::parse(&bytes, false).unwrap();
+        assert_eq!(parsed.sequence, 3);
+        assert_eq!(parsed.blocks, vec![0x10, 0x20, 0x3FFF]);
+    }
+
+    #[test]
+    fn revoke_block_roundtrip_64() {
+        let rb = RevokeBlock {
+            sequence: 9,
+            blocks: vec![0x1_0000_0000, 0x42],
+        };
+        let bytes = rb.emit(1024, true);
+        // r_count @12 = 16-byte header + 2 entries * 8 bytes.
+        assert_eq!(be32(&bytes, 12), 16 + 2 * 8);
+
+        let parsed = RevokeBlock::parse(&bytes, true).unwrap();
+        assert_eq!(parsed.sequence, 9);
+        // High 32 bits must survive in 64bit mode.
+        assert_eq!(parsed.blocks, vec![0x1_0000_0000, 0x42]);
+    }
+
+    #[test]
+    fn revoke_block_empty() {
+        let rb = RevokeBlock {
+            sequence: 1,
+            blocks: vec![],
+        };
+        let bytes = rb.emit(1024, false);
+        // Empty: r_count is just the header.
+        assert_eq!(be32(&bytes, 12), 16);
+
+        let parsed = RevokeBlock::parse(&bytes, false).unwrap();
+        assert!(parsed.blocks.is_empty());
     }
 
     #[test]
