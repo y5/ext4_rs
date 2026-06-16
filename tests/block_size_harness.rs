@@ -1956,3 +1956,145 @@ fn readdirplus_attrs_1k() {
 fn readdirplus_attrs_4k() {
     readdirplus_attrs(4096);
 }
+
+// --- POSIX default ACL inheritance + umask on create ---
+
+/// A directory with a (non-trivial) default ACL passes it to new children: each
+/// child gets a masq'd access ACL, its mode is clamped to the default, and a
+/// child directory also inherits the default ACL itself. Children created
+/// through the fuse entry points (which carry umask) drive this.
+fn default_acl_inherit(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "defacl");
+    const UNDEF: u32 = 0xFFFF_FFFF;
+    // Default ACL: owner r-x, user:1001 rw-, group r--, mask rw-, other ---.
+    // Non-trivial (named user + mask), so children store an access ACL.
+    let default_acl = acl_value(&[
+        (0x01, 0o5, UNDEF),
+        (0x02, 0o6, 1001),
+        (0x04, 0o4, UNDEF),
+        (0x10, 0o6, UNDEF),
+        (0x20, 0o0, UNDEF),
+    ]);
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.dir_mk("/p").expect("mkdir p");
+        let p = resolve(&ext4, "/p").expect("resolve p");
+        ext4.xattr_set(p, "system.posix_acl_default", &default_acl, 0)
+            .expect("set default acl");
+
+        // Request mode 0o777; the default ACL must clamp it.
+        ext4.fuse_create(p as u64, "file", InodeFileType::S_IFREG.bits() as u32 | 0o777, 0, 0)
+            .expect("create file");
+        ext4.fuse_mkdir(p as u64, "sub", InodeFileType::S_IFDIR.bits() as u32, 0)
+            .expect("mkdir sub");
+        ext4.fuse_mknod(p as u64, "fifo", InodeFileType::S_IFIFO.bits() as u32 | 0o777, 0, 0)
+            .expect("mknod fifo");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+
+    // Regular file: access ACL stored, mode clamped to 0o560 (owner from
+    // USER_OBJ=5, group from MASK=6, other from OTHER=0), enforcement works.
+    let file = resolve(&ext4, "/p/file").expect("resolve file");
+    assert!(
+        ext4.xattr_get(file, "system.posix_acl_access").is_ok(),
+        "file missing inherited access ACL @ {block_size}"
+    );
+    assert_eq!(
+        ext4.get_inode_ref(file).inode.mode() & 0o777,
+        0o560,
+        "file mode not clamped to default ACL @ {block_size}"
+    );
+    assert_eq!(
+        ext4.acl_access_check(file, 1001, 0, 2),
+        Some(true),
+        "user:1001 write should be allowed @ {block_size}"
+    );
+    assert_eq!(
+        ext4.acl_access_check(file, 1001, 0, 1),
+        Some(false),
+        "user:1001 exec should be denied @ {block_size}"
+    );
+    // A file is not a directory: it must NOT carry a default ACL.
+    assert_eq!(
+        ext4.xattr_get(file, "system.posix_acl_default").unwrap_err().error(),
+        Errno::ENODATA,
+        "file should not have a default ACL @ {block_size}"
+    );
+
+    // Subdirectory: inherits the default ACL verbatim, and has its own access ACL.
+    let sub = resolve(&ext4, "/p/sub").expect("resolve sub");
+    assert_eq!(
+        ext4.xattr_get(sub, "system.posix_acl_default").expect("sub default acl"),
+        default_acl,
+        "subdir did not inherit the default ACL @ {block_size}"
+    );
+    assert!(
+        ext4.xattr_get(sub, "system.posix_acl_access").is_ok(),
+        "subdir missing inherited access ACL @ {block_size}"
+    );
+
+    // FIFO: gets an access ACL but no default ACL.
+    let fifo = resolve(&ext4, "/p/fifo").expect("resolve fifo");
+    assert!(
+        ext4.xattr_get(fifo, "system.posix_acl_access").is_ok(),
+        "fifo missing inherited access ACL @ {block_size}"
+    );
+    assert_eq!(
+        ext4.xattr_get(fifo, "system.posix_acl_default").unwrap_err().error(),
+        Errno::ENODATA,
+        "fifo should not have a default ACL @ {block_size}"
+    );
+}
+
+/// With no default ACL on the parent, a create through the fuse layer applies
+/// umask to the requested mode (previously umask was ignored).
+fn umask_on_create(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "umask");
+
+    {
+        let mut ext4 = open_fs(&img);
+        ext4.fuse_create(
+            ROOT_INODE as u64,
+            "u",
+            InodeFileType::S_IFREG.bits() as u32 | 0o666,
+            0o022,
+            0,
+        )
+        .expect("create u");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let u = resolve(&ext4, "/u").expect("resolve u");
+    assert_eq!(
+        ext4.get_inode_ref(u).inode.mode() & 0o777,
+        0o644,
+        "umask 0o022 not applied to 0o666 @ {block_size}"
+    );
+}
+
+#[test]
+fn default_acl_inherit_1k() {
+    default_acl_inherit(1024);
+}
+#[test]
+fn default_acl_inherit_4k() {
+    default_acl_inherit(4096);
+}
+#[test]
+fn umask_on_create_1k() {
+    umask_on_create(1024);
+}
+#[test]
+fn umask_on_create_4k() {
+    umask_on_create(4096);
+}

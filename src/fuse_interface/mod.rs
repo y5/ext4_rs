@@ -147,6 +147,7 @@ impl Ext4 {
         }
         let inode_ref =
             self.create_special_with_attr(parent as u32, name, mode as u16, rdev, 0, 0)?;
+        self.posix_acl_create(parent as u32, inode_ref.inode_num, umask as u16)?;
         Ok(inode_ref)
     }
 
@@ -174,6 +175,7 @@ impl Ext4 {
             uid as u16,
             gid as u16,
         )?;
+        self.posix_acl_create(parent as u32, inode_ref.inode_num, umask as u16)?;
         Ok(inode_ref)
     }
 
@@ -190,6 +192,7 @@ impl Ext4 {
             return_errno_with_message!(Errno::EINVAL, "Invalid mode for directory creation");
         }
         let inode_ref = self.create(parent as u32, name, mode as u16)?;
+        self.posix_acl_create(parent as u32, inode_ref.inode_num, umask as u16)?;
         Ok(EOK)
     }
 
@@ -216,6 +219,7 @@ impl Ext4 {
         };
         let mode = file_type.bits();
         let inode_ref = self.create_with_attr(parent as u32, name, mode, uid as u16, gid as u16)?;
+        self.posix_acl_create(parent as u32, inode_ref.inode_num, umask as u16)?;
 
         Ok(inode_ref)
     }
@@ -530,6 +534,7 @@ impl Ext4 {
         } else {
             //create file
             let inode_ref = self.create(parent as u32, name, mode as u16)?;
+            self.posix_acl_create(parent as u32, inode_ref.inode_num, umask as u16)?;
         }
 
         Ok(EOK)
