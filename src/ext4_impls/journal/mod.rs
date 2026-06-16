@@ -21,6 +21,37 @@ pub use crate::ext4_defs::journal::{
     JBD2_REVOKE_BLOCK,
 };
 
+/// One block logged by a committed transaction: its final on-disk location and
+/// the log block holding its data, plus tag flags (ESCAPE handling at replay).
+pub struct LoggedBlock {
+    /// The block's final on-disk location (from the descriptor tag).
+    pub final_block: u64,
+    /// The log block holding this block's data (immediately follows the descriptor).
+    pub data_log_block: u64,
+    /// jbd2 tag flags (e.g. `JBD2_FLAG_ESCAPE`).
+    pub flags: u16,
+}
+
+/// A transaction confirmed committed during SCAN.
+pub struct ScannedTxn {
+    /// The transaction's commit ID (h_sequence).
+    pub sequence: u32,
+    /// Blocks logged by this transaction, in log order.
+    pub blocks: Vec<LoggedBlock>,
+    /// Log block indices of revoke blocks belonging to this transaction.
+    pub revoke_log_blocks: Vec<u64>,
+}
+
+/// Result of the SCAN pass (jbd2 PASS_SCAN): the committed transactions, in log
+/// order, and the sequence of the last committed transaction.
+pub struct ScanResult {
+    /// Committed transactions, in log order.
+    pub txns: Vec<ScannedTxn>,
+    /// Sequence of the last committed txn. If none were committed this is
+    /// `sb.sequence - 1` (one before the first expected commit).
+    pub last_sequence: u32,
+}
+
 /// The in-memory journal engine, anchored on the on-disk jbd2 superblock and
 /// the inode that backs the journal file (inode 8).
 pub struct Journal {
@@ -75,5 +106,114 @@ impl Journal {
         }
         fs.block_device.write_offset(pblock as usize * bs, data);
         Ok(())
+    }
+
+    /// SCAN pass (jbd2 PASS_SCAN, adapted): walk the live region of the log from
+    /// `sb.start` and collect every fully-committed transaction. A transaction is
+    /// a run of descriptor/data/revoke blocks (each carrying the expected
+    /// `h_sequence`) terminated by a valid COMMIT block. The log ends at the first
+    /// block whose magic mismatches, whose sequence belongs to an older
+    /// generation, or at a torn/invalid commit — and any trailing partial
+    /// transaction (logged but not committed) is discarded, exactly as jbd2 does.
+    pub fn scan(&self, fs: &Ext4) -> Result<ScanResult> {
+        // Recovery must reflect the *current* on-disk superblock: s_start and
+        // s_sequence are set when the journal goes dirty, after `Journal::load`
+        // cached `self.sb`. Re-read log block 0 so the walk anchors on the live
+        // (dirty) region rather than the stale cached state.
+        let sb_buf = self.read_log_block(fs, 0)?;
+        let sb = JournalSuperblock::parse(&sb_buf)?;
+
+        let fmt = TagFormat::from_features(sb.feature_incompat);
+        let has_64bit = sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+        let has_csum = sb.feature_incompat
+            & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+            != 0;
+        let seed = jbd2_csum_seed(&sb.uuid);
+
+        let first = sb.first;
+        let maxlen = sb.maxlen;
+        let mut cursor = sb.start;
+        let mut next_seq = sb.sequence;
+
+        // s_start == 0 means the journal is clean: nothing to recover.
+        if sb.start == 0 {
+            return Ok(ScanResult {
+                txns: Vec::new(),
+                last_sequence: next_seq.wrapping_sub(1),
+            });
+        }
+
+        let mut txns: Vec<ScannedTxn> = Vec::new();
+        // Accumulators for the (not-yet-committed) transaction at `next_seq`.
+        let mut cur_blocks: Vec<LoggedBlock> = Vec::new();
+        let mut cur_revokes: Vec<u64> = Vec::new();
+
+        // Bound the walk by maxlen iterations so a corrupt log can't loop forever.
+        for _ in 0..maxlen {
+            let block = self.read_log_block(fs, cursor)?;
+            // journal_header_t: h_magic@0, h_blocktype@4, h_sequence@8 (all BE u32).
+            let magic = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+            if magic != JBD2_MAGIC_NUMBER {
+                break; // end of log
+            }
+            let blocktype = u32::from_be_bytes([block[4], block[5], block[6], block[7]]);
+            let h_seq = u32::from_be_bytes([block[8], block[9], block[10], block[11]]);
+            if h_seq != next_seq {
+                break; // older/overwritten generation: the live log ends here
+            }
+
+            match blocktype {
+                JBD2_DESCRIPTOR_BLOCK => {
+                    let tags = parse_descriptor_block(&block, fmt, has_64bit)?;
+                    // Advance past the descriptor; each tag's data block is the
+                    // block immediately following, in order.
+                    cursor += 1;
+                    if cursor >= maxlen {
+                        cursor = first;
+                    }
+                    for tag in tags {
+                        cur_blocks.push(LoggedBlock {
+                            final_block: tag.blocknr,
+                            data_log_block: cursor as u64,
+                            flags: tag.flags,
+                        });
+                        cursor += 1;
+                        if cursor >= maxlen {
+                            cursor = first;
+                        }
+                    }
+                    continue; // cursor already advanced+wrapped
+                }
+                JBD2_REVOKE_BLOCK => {
+                    cur_revokes.push(cursor as u64);
+                }
+                JBD2_COMMIT_BLOCK => {
+                    // A torn/invalid commit ends the log without committing the
+                    // pending transaction (its accumulated blocks are discarded).
+                    if has_csum && !verify_commit_csum(&block, seed) {
+                        break;
+                    }
+                    txns.push(ScannedTxn {
+                        sequence: next_seq,
+                        blocks: core::mem::take(&mut cur_blocks),
+                        revoke_log_blocks: core::mem::take(&mut cur_revokes),
+                    });
+                    next_seq = next_seq.wrapping_add(1);
+                }
+                _ => break,
+            }
+
+            cursor += 1;
+            if cursor >= maxlen {
+                cursor = first;
+            }
+        }
+
+        let last_sequence = if txns.is_empty() {
+            sb.sequence.wrapping_sub(1)
+        } else {
+            txns.last().unwrap().sequence
+        };
+        Ok(ScanResult { txns, last_sequence })
     }
 }

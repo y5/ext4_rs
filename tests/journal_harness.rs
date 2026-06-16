@@ -226,6 +226,58 @@ fn stage_dirty_journal(fs: &Ext4, j: &Journal, txns: &[SynthTxn]) -> u32 {
 }
 
 #[test]
+fn recovery_scan_finds_last_commit_4k() {
+    if tool_missing("mkfs.ext4") {
+        eprintln!("skip: mkfs.ext4 missing");
+        return;
+    }
+    let img = fresh_image(4096, "jscan");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load").expect("journal");
+    let base = j.sb.sequence;
+
+    // Four single-block transactions; the 4th's commit will be corrupted.
+    let txns = vec![
+        SynthTxn { sequence: base,     blocks: vec![(1001, b"aaaa".to_vec())], revokes: vec![] },
+        SynthTxn { sequence: base + 1, blocks: vec![(1002, b"bbbb".to_vec())], revokes: vec![] },
+        SynthTxn { sequence: base + 2, blocks: vec![(1003, b"cccc".to_vec())], revokes: vec![] },
+        SynthTxn { sequence: base + 3, blocks: vec![(1004, b"dddd".to_vec())], revokes: vec![] },
+    ];
+    stage_dirty_journal(&fs, &j, &txns);
+
+    // Each single-block txn occupies 3 log blocks: [descriptor][data][commit].
+    // The 4th txn's commit is at log index first + 3*3 + 2 = first + 11. Corrupt it.
+    let first = j.sb.first;
+    let commit4 = first + 11;
+    let mut blk = j.read_log_block(&fs, commit4).unwrap();
+    blk[0..4].copy_from_slice(&[0, 0, 0, 0]); // smash the magic -> invalid commit
+    j.write_log_block(&fs, commit4, &blk).unwrap();
+
+    let scan = j.scan(&fs).expect("scan ok");
+    assert_eq!(scan.txns.len(), 3, "only 3 fully-committed txns");
+    assert_eq!(scan.last_sequence, base + 2);
+    // The 3 committed txns map their logged blocks to the right final locations.
+    assert_eq!(scan.txns[0].blocks[0].final_block, 1001);
+    assert_eq!(scan.txns[2].blocks[0].final_block, 1003);
+}
+
+#[test]
+fn recovery_scan_clean_journal_is_empty_4k() {
+    if tool_missing("mkfs.ext4") {
+        eprintln!("skip: mkfs.ext4 missing");
+        return;
+    }
+    let img = fresh_image(4096, "jscanclean");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load").expect("journal");
+    // Fresh mkfs journal has s_start == 0 => nothing to recover.
+    let scan = j.scan(&fs).expect("scan ok");
+    assert_eq!(scan.txns.len(), 0);
+}
+
+#[test]
 fn synth_dirty_journal_layout_4k() {
     if tool_missing("mkfs.ext4") {
         eprintln!("skip: mkfs.ext4 missing");
