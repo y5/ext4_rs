@@ -970,9 +970,57 @@ impl Ext4 {
         unimplemented!();
     }
 
-    /// Reposition read/write file offset
-    fn fuse_lseek(&mut self, ino: u64, fh: u64, offset: i64, whence: i32) {
-        unimplemented!();
+    /// Reposition read/write file offset.
+    ///
+    /// FUSE only forwards `SEEK_DATA`/`SEEK_HOLE` here (`SEEK_SET/CUR/END` are
+    /// resolved by the kernel), so this locates data/hole boundaries in a sparse
+    /// file at block granularity. Returns the resulting offset.
+    pub fn fuse_lseek(&self, ino: u64, fh: u64, offset: i64, whence: i32) -> Result<i64> {
+        const SEEK_DATA: i32 = 3;
+        const SEEK_HOLE: i32 = 4;
+
+        if whence != SEEK_DATA && whence != SEEK_HOLE {
+            return_errno_with_message!(Errno::EINVAL, "lseek: unsupported whence");
+        }
+        if offset < 0 {
+            return_errno_with_message!(Errno::EINVAL, "lseek: negative offset");
+        }
+
+        let inode_ref = self.get_inode_ref(ino as u32);
+        let size = inode_ref.inode.size() as i64;
+        // At or past EOF there is neither data nor an addressable hole.
+        if offset >= size {
+            return_errno_with_message!(Errno::ENXIO, "lseek: offset at or past EOF");
+        }
+
+        let bs = self.block_size() as i64;
+        // A logical block with no extent maps to physical block 0 — a hole
+        // (the same test read_at uses to zero-fill).
+        let is_hole = |lblk: u32| -> bool {
+            self.get_pblock_idx(&inode_ref, lblk)
+                .map(|p| p == 0)
+                .unwrap_or(true)
+        };
+
+        let want_data = whence == SEEK_DATA;
+        let mut o = offset;
+        while o < size {
+            let lblk = (o / bs) as u32;
+            if is_hole(lblk) != want_data {
+                // SEEK_DATA wants a mapped block; SEEK_HOLE wants a hole.
+                return Ok(o);
+            }
+            // Advance to the start of the next block.
+            o = (lblk as i64 + 1) * bs;
+        }
+
+        if want_data {
+            // Only holes remained before EOF.
+            return_errno_with_message!(Errno::ENXIO, "lseek: no data after offset")
+        } else {
+            // The region from the last data block to EOF is an implicit hole.
+            Ok(size)
+        }
     }
 
     /// Copy the specified range from the source inode to the destination inode

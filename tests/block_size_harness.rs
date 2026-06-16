@@ -2098,3 +2098,67 @@ fn umask_on_create_1k() {
 fn umask_on_create_4k() {
     umask_on_create(4096);
 }
+
+// --- lseek: SEEK_DATA / SEEK_HOLE on sparse files ---
+
+/// Build a sparse file (block 0 and block 3 written, blocks 1-2 holes, size 4
+/// blocks) and check the data/hole boundary search. SEEK_DATA/SEEK_HOLE return
+/// the offset unchanged when it already sits in the requested region, jump to
+/// the next region boundary otherwise, treat EOF as an implicit hole, and
+/// report ENXIO at/after EOF.
+fn lseek_data_hole(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "lseek");
+    let bs = block_size as i64;
+
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "sparse.bin", reg_mode()).expect("create");
+        ext4.write_at(f.inode_num, 0, &payload(block_size as usize)).expect("write blk0");
+        ext4.write_at(f.inode_num, (3 * bs) as usize, &payload(block_size as usize))
+            .expect("write blk3");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    let ino = resolve(&ext4, "/sparse.bin").expect("resolve") as u64;
+
+    const SEEK_DATA: i32 = 3;
+    const SEEK_HOLE: i32 = 4;
+    let data = |o: i64| ext4.fuse_lseek(ino, 0, o, SEEK_DATA);
+    let hole = |o: i64| ext4.fuse_lseek(ino, 0, o, SEEK_HOLE);
+
+    assert_eq!(data(0).unwrap(), 0, "DATA(0) @ {block_size}");
+    assert_eq!(hole(0).unwrap(), bs, "HOLE(0) @ {block_size}");
+    assert_eq!(data(bs).unwrap(), 3 * bs, "DATA(bs) skips hole run @ {block_size}");
+    assert_eq!(data(2 * bs).unwrap(), 3 * bs, "DATA(2bs) skips hole run @ {block_size}");
+    assert_eq!(hole(3 * bs).unwrap(), 4 * bs, "HOLE(3bs) == EOF @ {block_size}");
+    assert_eq!(data(100).unwrap(), 100, "DATA inside data returns offset @ {block_size}");
+    assert_eq!(hole(bs + 10).unwrap(), bs + 10, "HOLE inside hole returns offset @ {block_size}");
+    assert_eq!(
+        data(4 * bs).unwrap_err().error(),
+        Errno::ENXIO,
+        "DATA at EOF @ {block_size}"
+    );
+    assert_eq!(
+        hole(4 * bs).unwrap_err().error(),
+        Errno::ENXIO,
+        "HOLE at EOF @ {block_size}"
+    );
+    assert_eq!(
+        ext4.fuse_lseek(ino, 0, 0, 0).unwrap_err().error(),
+        Errno::EINVAL,
+        "bad whence @ {block_size}"
+    );
+}
+
+#[test]
+fn lseek_data_hole_1k() {
+    lseek_data_hole(1024);
+}
+#[test]
+fn lseek_data_hole_4k() {
+    lseek_data_hole(4096);
+}
