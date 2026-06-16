@@ -29,9 +29,9 @@ pub const JBD2_FLAG_DELETED: u16 = 4;
 pub const JBD2_FLAG_LAST_TAG: u16 = 8;   // last tag in this descriptor block
 
 /// Minimum number of bytes we must be able to read to parse the fields below.
-/// The journal superblock occupies a full block, but the fields this task cares
-/// about all live within the first 64 bytes. We require a conventional 1024-byte
-/// buffer so callers can't hand us a truncated block.
+/// The parsed fields span the first ~81 bytes (`s_checksum_type` is read at
+/// offset 80). We require 1024 bytes — the minimum sane on-disk journal block
+/// size — as the minimum, guarding against truncated blocks.
 const JBD2_SUPERBLOCK_MIN_LEN: usize = 1024;
 
 /// Parsed jbd2 journal superblock (`journal_superblock_t`).
@@ -152,6 +152,15 @@ mod tests {
     #[test]
     fn journal_superblock_rejects_bad_magic() {
         let b = vec![0u8; 1024];               // all-zero == wrong magic
+        assert!(JournalSuperblock::parse(&b).is_err());
+    }
+
+    #[test]
+    fn journal_superblock_rejects_short_buffer() {
+        // Valid magic but a buffer shorter than the minimum: the length guard must
+        // reject it (this is what keeps the field reads panic-free).
+        let mut b = vec![0u8; 64];
+        b[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
         assert!(JournalSuperblock::parse(&b).is_err());
     }
 }
