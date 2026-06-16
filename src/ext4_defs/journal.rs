@@ -5,6 +5,7 @@
 
 use crate::prelude::*;
 use crate::return_errno_with_message;
+use crate::utils::{ext4_crc32c, EXT4_CRC32_INIT};
 
 pub const JBD2_MAGIC_NUMBER: u32 = 0xC03B3998;
 
@@ -45,6 +46,39 @@ fn put_be32(buf: &mut [u8], off: usize, v: u32) {
 
 fn put_be64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_be_bytes());
+}
+
+// jbd2 (CSUM_V2/V3) checksum helpers.
+//
+// jbd2 computes checksums as Linux `crc32c(seed, buf, len)`, which seeds from
+// `~0 = 0xFFFFFFFF` and applies NO final inversion. That maps EXACTLY onto this
+// crate's RAW reflected `ext4_crc32c(crc, buf, size)` (poly 0x1EDC6F41, no final
+// XOR) seeded with `EXT4_CRC32_INIT` (0xFFFFFFFF) and chained via the returned
+// value — so no extra inversion is needed here. These match jbd2's
+// `jbd2_chksum()`/`jbd2_superblock_csum()` conventions; they are validated
+// authoritatively against e2fsck/debugfs in later phases (Phases 2/4).
+
+/// jbd2 csum seed derived from the journal UUID: `crc32c(~0, uuid, 16)`.
+pub fn jbd2_csum_seed(uuid: &[u8; 16]) -> u32 {
+    ext4_crc32c(EXT4_CRC32_INIT, uuid, JBD2_UUID_LEN as u32)
+}
+
+/// Block-level checksum over a whole journal block (descriptor/commit/revoke),
+/// seeded with `seed` (the journal's `j_csum_seed`).
+///
+/// The caller must zero the on-block checksum field BEFORE calling and store the
+/// returned value back into that field afterwards; this helper just computes the
+/// CRC32c over the bytes it is given.
+pub fn jbd2_block_csum(seed: u32, block: &[u8]) -> u32 {
+    ext4_crc32c(seed, block, block.len() as u32)
+}
+
+/// Per-data-block tag checksum: folds the transaction `sequence` (big-endian
+/// u32) into `seed`, then chains the data block, per jbd2's CSUM_V2/V3 tag
+/// checksum. CSUM_V2 stores the low 16 bits in the tag; CSUM_V3 stores all 32.
+pub fn jbd2_data_block_csum(seed: u32, sequence: u32, data: &[u8]) -> u32 {
+    let c = ext4_crc32c(seed, &sequence.to_be_bytes(), 4);
+    ext4_crc32c(c, data, data.len() as u32)
 }
 
 // Block types (journal_header_t.h_blocktype)
@@ -722,6 +756,49 @@ mod tests {
 
         let parsed = RevokeBlock::parse(&bytes, false).unwrap();
         assert!(parsed.blocks.is_empty());
+    }
+
+    // jbd2 checksum helpers (Task 0.6).
+    //
+    // These tests pin the COMPOSITION ORDER and seeding of the helpers by
+    // open-coding the exact `ext4_crc32c` call sequence the helper is documented
+    // to perform — NOT by calling the helper a second time (that would
+    // self-confirm). The numeric results here are NOT authoritative jbd2 vectors;
+    // authoritative validation against e2fsck/debugfs happens in Phases 2/4.
+
+    #[test]
+    fn jbd2_seed_is_crc_of_uuid() {
+        let uuid = [0xABu8; 16];
+        let expected = ext4_crc32c(EXT4_CRC32_INIT, &uuid, 16); // open-coded reference
+        assert_eq!(jbd2_csum_seed(&uuid), expected);
+    }
+
+    #[test]
+    fn jbd2_block_csum_seeds_and_covers_whole_block() {
+        let uuid = [0x5Au8; 16];
+        let seed = ext4_crc32c(EXT4_CRC32_INIT, &uuid, 16);
+        let mut block = vec![0u8; 1024];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let expected = ext4_crc32c(seed, &block, 1024);
+        assert_eq!(jbd2_block_csum(seed, &block), expected);
+        // sanity: changing one byte changes the checksum
+        let mut b2 = block.clone();
+        b2[500] ^= 0xFF;
+        assert_ne!(jbd2_block_csum(seed, &b2), expected);
+    }
+
+    #[test]
+    fn jbd2_data_block_csum_folds_sequence_then_data() {
+        let seed = 0x1234_5678u32;
+        let data = (0..512u32).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
+        let seq = 0x00AA_BB01u32;
+        let c = ext4_crc32c(seed, &seq.to_be_bytes(), 4); // open-coded reference
+        let expected = ext4_crc32c(c, &data, data.len() as u32);
+        assert_eq!(jbd2_data_block_csum(seed, seq, &data), expected);
+        // sequence is folded in: a different seq yields a different csum for same data
+        assert_ne!(jbd2_data_block_csum(seed, seq.wrapping_add(1), &data), expected);
     }
 
     #[test]
