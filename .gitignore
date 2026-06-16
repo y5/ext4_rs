@@ -2,4 +2,4 @@
 *.img
 test_files*
 tmp
-/docs
+/docs.worktrees/
