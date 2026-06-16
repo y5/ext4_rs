@@ -2162,3 +2162,170 @@ fn lseek_data_hole_1k() {
 fn lseek_data_hole_4k() {
     lseek_data_hole(4096);
 }
+
+// --- fallocate: allocate / KEEP_SIZE / PUNCH_HOLE ---
+
+const FALLOC_KEEP_SIZE: i32 = 0x01;
+const FALLOC_PUNCH_HOLE: i32 = 0x02;
+
+/// Preallocation: mode 0 maps the range and extends the size, and the range
+/// reads back as zeros; KEEP_SIZE reserves blocks without changing the size;
+/// invalid/unsupported requests are rejected.
+fn fallocate_alloc(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "falloc_a");
+    let bs = block_size as i64;
+    const SEEK_DATA: i32 = 3;
+
+    let ino;
+    let ino_keep;
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "a.bin", reg_mode()).expect("create a");
+        ino = f.inode_num;
+        ext4.fuse_fallocate(ino as u64, 0, 0, 4 * bs, 0).expect("fallocate");
+
+        let k = ext4.create(ROOT_INODE, "k.bin", reg_mode()).expect("create k");
+        ino_keep = k.inode_num;
+        ext4.fuse_fallocate(ino_keep as u64, 0, 0, 2 * bs, FALLOC_KEEP_SIZE)
+            .expect("fallocate keep");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+
+    // mode 0: size extended, range reads as zeros, blocks mapped.
+    assert_eq!(
+        ext4.get_inode_ref(ino).inode.size(),
+        (4 * bs) as u64,
+        "size after allocate @ {block_size}"
+    );
+    let mut buf = vec![0xffu8; (4 * bs) as usize];
+    let n = ext4.read_at(ino, 0, &mut buf).expect("read");
+    assert_eq!(n, (4 * bs) as usize, "short read @ {block_size}");
+    assert!(buf.iter().all(|&b| b == 0), "allocated range not zero @ {block_size}");
+    assert_eq!(
+        ext4.fuse_lseek(ino as u64, 0, 0, SEEK_DATA).unwrap(),
+        0,
+        "allocated blocks not mapped @ {block_size}"
+    );
+
+    // KEEP_SIZE: size unchanged but blocks reserved.
+    assert_eq!(
+        ext4.get_inode_ref(ino_keep).inode.size(),
+        0,
+        "KEEP_SIZE must not change size @ {block_size}"
+    );
+    assert!(
+        ext4.get_inode_ref(ino_keep).inode.blocks_count() > 0,
+        "KEEP_SIZE did not reserve blocks @ {block_size}"
+    );
+
+    // Errors.
+    assert_eq!(
+        ext4.fuse_fallocate(ino as u64, 0, 0, 0, 0).unwrap_err().error(),
+        Errno::EINVAL,
+        "zero length @ {block_size}"
+    );
+    assert_eq!(
+        ext4.fuse_fallocate(ino as u64, 0, 0, bs, FALLOC_PUNCH_HOLE).unwrap_err().error(),
+        Errno::EINVAL,
+        "punch without keep_size @ {block_size}"
+    );
+    assert_eq!(
+        ext4.fuse_fallocate(ino as u64, 0, 0, bs, 0x08).unwrap_err().error(),
+        Errno::ENOTSUP,
+        "collapse_range unsupported @ {block_size}"
+    );
+}
+
+/// Punch hole: an aligned interior punch frees blocks (read as zeros, hole
+/// observable via lseek) while surrounding data and the file size survive; a
+/// sub-block punch zeroes just the requested bytes in a mapped block.
+fn fallocate_punch(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "falloc_p");
+    let bs = block_size as i64;
+    const SEEK_DATA: i32 = 3;
+    const SEEK_HOLE: i32 = 4;
+
+    let ino;
+    let ino_partial;
+    {
+        let ext4 = open_fs(&img);
+        let f = ext4.create(ROOT_INODE, "p.bin", reg_mode()).expect("create p");
+        ino = f.inode_num;
+        ext4.write_at(ino, 0, &vec![0xABu8; (4 * bs) as usize]).expect("write p");
+        // Punch the middle two blocks [bs, 3*bs).
+        ext4.fuse_fallocate(ino as u64, 0, bs, 2 * bs, FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE)
+            .expect("punch");
+
+        // Sub-block punch: zero bytes [10, 20) of a single data block.
+        let pp = ext4.create(ROOT_INODE, "pp.bin", reg_mode()).expect("create pp");
+        ino_partial = pp.inode_num;
+        ext4.write_at(ino_partial, 0, &vec![0xABu8; bs as usize]).expect("write pp");
+        ext4.fuse_fallocate(ino_partial as u64, 0, 10, 10, FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE)
+            .expect("partial punch");
+    }
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+
+    // Size unchanged, punched region zero, surrounding data intact.
+    assert_eq!(
+        ext4.get_inode_ref(ino).inode.size(),
+        (4 * bs) as u64,
+        "punch changed size @ {block_size}"
+    );
+    let mut mid = vec![0xffu8; (2 * bs) as usize];
+    ext4.read_at(ino, bs as usize, &mut mid).expect("read mid");
+    assert!(mid.iter().all(|&b| b == 0), "punched region not zero @ {block_size}");
+    let mut blk0 = vec![0u8; bs as usize];
+    ext4.read_at(ino, 0, &mut blk0).expect("read blk0");
+    assert!(blk0.iter().all(|&b| b == 0xAB), "block 0 data lost @ {block_size}");
+    let mut blk3 = vec![0u8; bs as usize];
+    ext4.read_at(ino, (3 * bs) as usize, &mut blk3).expect("read blk3");
+    assert!(blk3.iter().all(|&b| b == 0xAB), "block 3 data lost @ {block_size}");
+    // Hole observable.
+    assert_eq!(
+        ext4.fuse_lseek(ino as u64, 0, bs, SEEK_HOLE).unwrap(),
+        bs,
+        "SEEK_HOLE not at punched block @ {block_size}"
+    );
+    assert_eq!(
+        ext4.fuse_lseek(ino as u64, 0, bs, SEEK_DATA).unwrap(),
+        3 * bs,
+        "SEEK_DATA past hole wrong @ {block_size}"
+    );
+
+    // Sub-block punch zeroed only [10, 20).
+    let mut b = vec![0u8; bs as usize];
+    ext4.read_at(ino_partial, 0, &mut b).expect("read pp");
+    for i in 0..bs as usize {
+        let expect = if (10..20).contains(&i) { 0u8 } else { 0xABu8 };
+        assert_eq!(b[i], expect, "partial punch byte {i} @ {block_size}");
+    }
+}
+
+#[test]
+fn fallocate_alloc_1k() {
+    fallocate_alloc(1024);
+}
+#[test]
+fn fallocate_alloc_4k() {
+    fallocate_alloc(4096);
+}
+#[test]
+#[ignore = "PUNCH_HOLE pending extent_remove_space interior-split fix (Task 5)"]
+fn fallocate_punch_1k() {
+    fallocate_punch(1024);
+}
+#[test]
+#[ignore = "PUNCH_HOLE pending extent_remove_space interior-split fix (Task 5)"]
+fn fallocate_punch_4k() {
+    fallocate_punch(4096);
+}

@@ -965,9 +965,125 @@ impl Ext4 {
     // ) {
     // }
 
-    /// Preallocate or deallocate space to a file
-    fn fuse_fallocate(&mut self, ino: u64, fh: u64, offset: i64, length: i64, mode: i32) {
-        unimplemented!();
+    /// Preallocate or deallocate space to a file.
+    ///
+    /// Supports mode 0 (allocate and extend), `FALLOC_FL_KEEP_SIZE` (allocate
+    /// without changing the size), and `FALLOC_FL_PUNCH_HOLE` (deallocate a
+    /// range, leaving a hole). Other modes (COLLAPSE/ZERO/INSERT_RANGE) return
+    /// `ENOTSUP`. The crate has no unwritten-extent support, so a preallocated
+    /// hole is backed by real, zeroed blocks.
+    pub fn fuse_fallocate(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+    ) -> Result<()> {
+        const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+        const SUPPORTED: i32 = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
+
+        if offset < 0 || length <= 0 {
+            return_errno_with_message!(Errno::EINVAL, "fallocate: bad offset/length");
+        }
+        if mode & !SUPPORTED != 0 {
+            return_errno_with_message!(Errno::ENOTSUP, "fallocate: unsupported mode");
+        }
+        let punch = mode & FALLOC_FL_PUNCH_HOLE != 0;
+        let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
+        // Linux requires PUNCH_HOLE to be combined with KEEP_SIZE.
+        if punch && !keep_size {
+            return_errno_with_message!(Errno::EINVAL, "fallocate: PUNCH_HOLE needs KEEP_SIZE");
+        }
+
+        let bs = self.block_size() as i64;
+        let start = offset;
+        let end = offset + length;
+        let mut inode_ref = self.get_inode_ref(ino as u32);
+
+        if punch {
+            // Remove the extents of the fully-covered interior blocks; zero the
+            // partial bytes in any mapped edge block (size never changes).
+            let aligned_start = ((start + bs - 1) / bs) * bs; // round up
+            let aligned_end = (end / bs) * bs; // round down
+            if aligned_start < aligned_end {
+                self.extent_remove_space(
+                    &mut inode_ref,
+                    (aligned_start / bs) as u32,
+                    (aligned_end / bs - 1) as u32,
+                )?;
+                self.write_back_inode(&mut inode_ref);
+                if start < aligned_start {
+                    self.fallocate_zero_partial(&inode_ref, start, aligned_start);
+                }
+                if aligned_end < end {
+                    self.fallocate_zero_partial(&inode_ref, aligned_end, end);
+                }
+            } else {
+                // No whole block covered: a single contiguous partial span.
+                self.fallocate_zero_partial(&inode_ref, start, end);
+            }
+            return Ok(());
+        }
+
+        // Allocate: fill only the holes in [start, end) with unwritten extents,
+        // preserving existing data. Unwritten extents read back as zeros (the
+        // read path honors the flag), so no disk zeroing is needed and e2fsck
+        // does not require i_size to cover them.
+        let start_blk = (start / bs) as usize;
+        let end_blk = ((end + bs - 1) / bs) as usize; // exclusive
+        let mut start_bgid = 0u32;
+        let mut lb = start_blk;
+        while lb < end_blk {
+            if self.get_pblock_idx(&inode_ref, lb as u32).unwrap_or(0) != 0 {
+                lb += 1;
+                continue;
+            }
+            let mut run_end = lb + 1;
+            while run_end < end_blk
+                && self.get_pblock_idx(&inode_ref, run_end as u32).unwrap_or(0) == 0
+            {
+                run_end += 1;
+            }
+            let count = run_end - lb;
+            let allocated =
+                self.map_inode_pblk_batch(&mut inode_ref, &mut start_bgid, lb as u32, count, true)?;
+            if allocated.len() < count {
+                return_errno_with_message!(Errno::ENOSPC, "fallocate: out of space");
+            }
+            lb = run_end;
+        }
+
+        // Grow the size unless KEEP_SIZE was requested.
+        if !keep_size && end as u64 > inode_ref.inode.size() {
+            inode_ref.inode.set_size(end as u64);
+            self.write_back_inode(&mut inode_ref);
+        }
+        Ok(())
+    }
+
+    /// Zero the byte range `[start, end)` within whatever mapped blocks it
+    /// touches (a hole is already zeros, so unmapped blocks are skipped — they
+    /// are not allocated). Used by PUNCH_HOLE for partial edge blocks.
+    fn fallocate_zero_partial(&self, inode_ref: &Ext4InodeRef, start: i64, end: i64) {
+        let bs = self.block_size() as i64;
+        let mut lb = start / bs;
+        while lb * bs < end {
+            let blk_start = lb * bs;
+            let lo = core::cmp::max(start, blk_start) - blk_start;
+            let hi = core::cmp::min(end, blk_start + bs) - blk_start;
+            let pblk = self.get_pblock_idx(inode_ref, lb as u32).unwrap_or(0);
+            if pblk != 0 {
+                let off = pblk as usize * bs as usize;
+                let mut data = self.block_device.read_offset(off, bs as usize);
+                for b in &mut data[lo as usize..hi as usize] {
+                    *b = 0;
+                }
+                self.block_device.write_offset(off, &data);
+            }
+            lb += 1;
+        }
     }
 
     /// Reposition read/write file offset.

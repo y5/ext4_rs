@@ -106,6 +106,21 @@ impl Ext4 {
         return_errno_with_message!(Errno::EIO, "search extent fail");
     }
 
+    /// Map a logical block to its physical block and report whether the covering
+    /// extent is unwritten (preallocated). A hole maps to `(0, false)`. An
+    /// unwritten extent reads back as zeros even though it has a real physical
+    /// block, so callers (read path) must treat `unwritten == true` like a hole.
+    pub fn get_pblock_state(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> (Ext4Fsblk, bool) {
+        match self.find_extent(inode_ref, lblock) {
+            Ok(path) => {
+                let node = path.path.last().unwrap();
+                let unwritten = node.extent.map(|e| e.is_unwritten()).unwrap_or(false);
+                (node.pblock, unwritten)
+            }
+            Err(_) => (0, false),
+        }
+    }
+
     /// Allocate a new block
     pub fn allocate_new_block(&self, inode_ref: &mut Ext4InodeRef) -> Result<Ext4Fsblk> {
         let mut super_block = self.read_super_block();
@@ -278,6 +293,7 @@ impl Ext4 {
         start_bgid: &mut u32,
         start_lblock: u32,
         block_count: usize,
+        unwritten: bool,
     ) -> Result<Vec<Ext4Fsblk>> {
         // Allocate the physical blocks.
         let allocated_blocks = self.balloc_alloc_block_batch(inode_ref, start_bgid, block_count)?;
@@ -314,14 +330,21 @@ impl Ext4 {
             contiguous_segments.push(current_segment);
         }
 
-        // Maximum blocks a single (written) extent can describe.
-        const MAX_EXTENT_LENGTH: usize = EXT_INIT_MAX_LEN as usize;
+        // Maximum blocks a single extent can describe. An unwritten extent
+        // stores its length as `actual_len | EXT_INIT_MAX_LEN`, so its actual
+        // length must stay below EXT_INIT_MAX_LEN; a written extent can use the
+        // full EXT_INIT_MAX_LEN.
+        let max_extent_length = if unwritten {
+            EXT_INIT_MAX_LEN as usize - 1
+        } else {
+            EXT_INIT_MAX_LEN as usize
+        };
 
         for segment in contiguous_segments {
             let mut segment_start = 0;
             while segment_start < segment.len() {
                 let sub_segment_length =
-                    core::cmp::min(MAX_EXTENT_LENGTH, segment.len() - segment_start);
+                    core::cmp::min(max_extent_length, segment.len() - segment_start);
                 let first_physical_block = segment[segment_start];
 
                 let mut newex = Ext4Extent::default();
@@ -329,6 +352,9 @@ impl Ext4 {
                 newex.store_pblock(first_physical_block);
                 newex.block_count = sub_segment_length as u16;
 
+                // Validate the initialized form first: is_valid_extent rejects
+                // block_count > EXT_INIT_MAX_LEN, which the unwritten flag would
+                // trip. Mark unwritten only after it passes.
                 if !self.is_valid_extent(&newex, inode_ref) {
                     log::error!(
                         "[Map Batch] Invalid extent detected: first_block={}, block_count={}",
@@ -336,6 +362,9 @@ impl Ext4 {
                         newex.block_count
                     );
                     return return_errno_with_message!(Errno::EINVAL, "Invalid extent detected");
+                }
+                if unwritten {
+                    newex.mark_unwritten();
                 }
 
                 self.insert_extent(inode_ref, &mut newex)?;
@@ -392,7 +421,7 @@ impl Ext4 {
         let start_lblock = core::cmp::max(iblock, last_extent_end);
 
         let allocated_blocks =
-            self.map_inode_pblk_batch(inode_ref, start_bgid, start_lblock, block_count)?;
+            self.map_inode_pblk_batch(inode_ref, start_bgid, start_lblock, block_count, false)?;
 
         if allocated_blocks.is_empty() {
             return Ok(Vec::new());

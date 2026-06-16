@@ -270,21 +270,13 @@ impl Ext4 {
         if unaligned_start_offset > 0 {
             let adjust_read_size = min(block_size - unaligned_start_offset, read_buf_len);
 
-            // get iblock physical block id
-            let pblock_idx = match self.get_pblock_idx(&inode_ref, iblock as u32) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "Failed to get physical block for logical block"
-                    );
-                }
-            };
+            // get iblock physical block id + unwritten state
+            let (pblock_idx, unwritten) = self.get_pblock_state(&inode_ref, iblock as u32);
 
-            // LOCAL FIX (hole): a logical block with no extent maps to physical
-            // block 0. Reading device block 0 returns the superblock area, not
-            // the file's data — POSIX requires a hole to read as zeros.
-            if pblock_idx == 0 {
+            // A hole (physical block 0) reads as zeros — reading device block 0
+            // would return the superblock area. An unwritten (preallocated)
+            // extent also reads as zeros despite having a real physical block.
+            if pblock_idx == 0 || unwritten {
                 for b in &mut read_buf[cursor..cursor + adjust_read_size] {
                     *b = 0;
                 }
@@ -320,20 +312,12 @@ impl Ext4 {
                 }
             }
 
-            // get iblock physical block id
-            let pblock_idx = match self.get_pblock_idx(&inode_ref, iblock as u32) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "Failed to get physical block for logical block"
-                    );
-                }
-            };
+            // get iblock physical block id + unwritten state
+            let (pblock_idx, unwritten) = self.get_pblock_state(&inode_ref, iblock as u32);
 
-            // LOCAL FIX (hole): physical block 0 means this logical block is
-            // unmapped (a hole) — read it as zeros, not the on-disk superblock.
-            if pblock_idx == 0 {
+            // A hole (physical block 0) or an unwritten (preallocated) extent
+            // reads as zeros rather than touching the on-disk block.
+            if pblock_idx == 0 || unwritten {
                 for b in &mut read_buf[cursor..cursor + read_length] {
                     *b = 0;
                 }
@@ -433,7 +417,7 @@ impl Ext4 {
                 }
                 let count = run_end - lb;
                 let allocated =
-                    self.map_inode_pblk_batch(&mut inode_ref, &mut start_bgid, lb as u32, count)?;
+                    self.map_inode_pblk_batch(&mut inode_ref, &mut start_bgid, lb as u32, count, false)?;
                 new_blocks += allocated.len();
                 if allocated.len() < count {
                     // Out of space partway through this run of holes.
