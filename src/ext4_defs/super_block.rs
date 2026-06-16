@@ -152,6 +152,12 @@ impl Ext4Superblock {
         self.default_hash_version
     }
 
+    /// Whether the `dir_index` compat feature is set (HTree indexes allowed).
+    pub fn has_feature_dir_index(&self) -> bool {
+        const EXT4_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
+        self.features_compatible & EXT4_FEATURE_COMPAT_DIR_INDEX != 0
+    }
+
     /// Returns the number of inodes in each block group.
     pub fn inodes_per_group(&self) -> u32 {
         self.inodes_per_group

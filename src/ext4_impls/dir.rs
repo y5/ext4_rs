@@ -253,6 +253,11 @@ impl Ext4 {
         // directory (e.g. `ls` reporting `d` for a plain file).
         let de_type = de_type_from_inode(&child.inode);
 
+        // Already an HTree directory: hash to the right leaf, splitting as needed.
+        if parent.inode.is_index() {
+            return self.dx_add_entry(parent, child.inode_num, name, de_type);
+        }
+
         // calculate total blocks
         let inode_size: u64 = parent.inode.size();
         let block_size = self.super_block.block_size();
@@ -280,6 +285,13 @@ impl Ext4 {
 
             // go ot next block
             iblock += 1;
+        }
+
+        // A full single-block directory becomes HTree-indexed (matching ext4's
+        // make_indexed_dir) when the fs advertises the dir_index feature.
+        if total_blocks == 1 && self.super_block.has_feature_dir_index() {
+            self.dx_convert_to_htree(parent)?;
+            return self.dx_add_entry(parent, child.inode_num, name, de_type);
         }
 
         // no space in existing blocks, need to add new block

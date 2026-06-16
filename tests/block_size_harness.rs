@@ -2859,3 +2859,58 @@ fn htree_read_lookup_multilevel_1k() {
 
     fsck_clean(&img);
 }
+
+/// Populate the root directory with `n` entries via the crate; it must convert
+/// to an HTree index on overflow, stay e2fsck-clean, and find every entry back.
+fn htree_create_roundtrip(block_size: u32, n: usize) {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let img = fresh_image(block_size, "htcreate");
+    let mut names = Vec::with_capacity(n);
+    {
+        let ext4 = open_fs(&img);
+        for i in 0..n {
+            let name = format!("entry_{:05}.dat", i);
+            ext4.create(ROOT_INODE, &name, reg_mode())
+                .unwrap_or_else(|_| panic!("create {name} @ {block_size}"));
+            names.push(name);
+        }
+    }
+
+    // e2fsck validates the htree: hash ordering, block coverage, dx checksums.
+    fsck_clean(&img);
+
+    let ext4 = open_fs(&img);
+    assert!(
+        ext4.get_inode_ref(ROOT_INODE).inode.is_index(),
+        "root not htree-indexed after {n} adds @ {block_size}"
+    );
+
+    // Every entry is found back through the index.
+    for name in &names {
+        let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        ext4.dir_find_entry(ROOT_INODE, name, &mut res)
+            .unwrap_or_else(|_| panic!("lookup {name} @ {block_size}"));
+        assert!(res.dentry.inode != 0, "zero inode for {name} @ {block_size}");
+    }
+
+    let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+    assert_eq!(
+        ext4.dir_find_entry(ROOT_INODE, "no_such_entry.dat", &mut res)
+            .unwrap_err()
+            .error(),
+        Errno::ENOENT,
+        "missing-name lookup @ {block_size}"
+    );
+}
+
+#[test]
+fn htree_create_4k() {
+    htree_create_roundtrip(4096, 400);
+}
+
+#[test]
+fn htree_create_1k() {
+    htree_create_roundtrip(1024, 400);
+}

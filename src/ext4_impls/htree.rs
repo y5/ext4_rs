@@ -345,3 +345,378 @@ impl Ext4 {
         Ok(EOK)
     }
 }
+
+// --- HTree index maintenance (create / insert / split) ---------------------
+
+use crate::utils::{ext4_crc32c, EXT4_CRC32_INIT};
+
+const DX_ENTRY_SIZE: usize = 8;
+const DX_TAIL_SIZE: usize = 8;
+
+#[inline]
+fn dx_count(d: &[u8], eo: usize) -> u16 {
+    u16::from_le_bytes([d[eo + 2], d[eo + 3]])
+}
+#[inline]
+fn dx_limit(d: &[u8], eo: usize) -> u16 {
+    u16::from_le_bytes([d[eo], d[eo + 1]])
+}
+#[inline]
+fn dx_set_count(d: &mut [u8], eo: usize, c: u16) {
+    d[eo + 2..eo + 4].copy_from_slice(&c.to_le_bytes());
+}
+#[inline]
+fn dx_set_limit(d: &mut [u8], eo: usize, l: u16) {
+    d[eo..eo + 2].copy_from_slice(&l.to_le_bytes());
+}
+#[inline]
+fn dx_get_entry(d: &[u8], eo: usize, i: usize) -> (u32, u32) {
+    let o = eo + i * DX_ENTRY_SIZE;
+    (
+        u32::from_le_bytes(d[o..o + 4].try_into().unwrap()),
+        u32::from_le_bytes(d[o + 4..o + 8].try_into().unwrap()),
+    )
+}
+#[inline]
+fn dx_set_entry(d: &mut [u8], eo: usize, i: usize, hash: u32, blk: u32) {
+    let o = eo + i * DX_ENTRY_SIZE;
+    d[o..o + 4].copy_from_slice(&hash.to_le_bytes());
+    d[o + 4..o + 8].copy_from_slice(&blk.to_le_bytes());
+}
+
+/// Aligned on-disk length of a directory entry with a `name_len`-byte name.
+fn aligned_de_len(name_len: usize) -> usize {
+    let mut l = size_of::<Ext4FakeDirEntry>() + name_len;
+    if l % 4 != 0 {
+        l += 4 - (l % 4);
+    }
+    l
+}
+
+impl Ext4 {
+    /// Max dx entries that fit in a block whose entry array starts at `eo`,
+    /// reserving room for the trailing 8-byte dx_tail (metadata_csum).
+    fn dx_block_limit(&self, eo: usize) -> u16 {
+        ((self.block_size() - eo - DX_TAIL_SIZE) / DX_ENTRY_SIZE) as u16
+    }
+
+    /// Compute and store a dx index block's checksum in its trailing dx_tail.
+    fn dx_set_csum(&self, block: &mut Block, dir_ino: u32, ino_gen: u32, eo: usize) {
+        let count = dx_count(&block.data, eo) as usize;
+        let limit = dx_limit(&block.data, eo) as usize;
+        let tail_off = eo + limit * DX_ENTRY_SIZE;
+
+        // Inode csum seed: crc32c(crc32c(crc32c(INIT, uuid), ino), generation).
+        let uuid = self.super_block.uuid;
+        let mut seed = ext4_crc32c(EXT4_CRC32_INIT, &uuid, uuid.len() as u32);
+        seed = ext4_crc32c(seed, &dir_ino.to_le_bytes(), 4);
+        seed = ext4_crc32c(seed, &ino_gen.to_le_bytes(), 4);
+
+        // crc over the header+entries, then the dx_tail with a zeroed checksum
+        // (dt_reserved + dt_checksum = 8 zero bytes).
+        let size = eo + count * DX_ENTRY_SIZE;
+        let mut csum = ext4_crc32c(seed, &block.data[..size], size as u32);
+        csum = ext4_crc32c(csum, &[0u8; DX_TAIL_SIZE], DX_TAIL_SIZE as u32);
+
+        block.data[tail_off..tail_off + 4].copy_from_slice(&0u32.to_le_bytes());
+        block.data[tail_off + 4..tail_off + 8].copy_from_slice(&csum.to_le_bytes());
+    }
+
+    /// The directory's hash version (from its dx_root) and the fs hash seed.
+    fn dx_hash_params(&self, dir: &Ext4InodeRef) -> Result<(u8, [u32; 4])> {
+        let bs = self.block_size();
+        let p0 = self.get_pblock_idx(dir, 0)?;
+        let root = Block::load(&self.block_device, p0 as usize * bs, bs);
+        Ok((root.data[0x1c], self.super_block.hash_seed()))
+    }
+
+    /// Walk a linear leaf block, returning each used entry as (name, inode,
+    /// file_type). Skips `.`/`..` and unused slots.
+    fn dx_read_leaf_entries(&self, data: &[u8]) -> Vec<(String, u32, u8)> {
+        let mut out = Vec::new();
+        let limit = self.block_size() - size_of::<Ext4DirEntryTail>();
+        let mut off = 0;
+        while off < limit {
+            let de = match Ext4DirEntry::try_from(&data[off..]) {
+                Ok(de) => de,
+                Err(_) => break,
+            };
+            let rl = de.entry_len() as usize;
+            if rl == 0 {
+                break;
+            }
+            if !de.unused() && de.name_len > 0 {
+                let name = de.get_name();
+                if name != "." && name != ".." {
+                    out.push((name, de.inode, de.get_de_type()));
+                }
+            }
+            off += rl;
+        }
+        out
+    }
+
+    /// Write `items` into `block` as a fresh linear leaf (last entry spans to
+    /// the tail), then set the tail checksum.
+    fn dx_write_leaf(
+        &self,
+        block: &mut Block,
+        items: &[(String, u32, u8)],
+        dir_ino: u32,
+        ino_gen: u32,
+    ) {
+        for b in block.data.iter_mut() {
+            *b = 0;
+        }
+        let tail_start = self.block_size() - size_of::<Ext4DirEntryTail>();
+
+        if items.is_empty() {
+            let mut de = Ext4DirEntry::default();
+            de.write_entry(tail_start as u16, 0, "", DirEntryType::EXT4_DE_UNKNOWN);
+            de.copy_to_slice(&mut block.data, 0);
+        } else {
+            let mut off = 0;
+            for (i, (name, ino, ty)) in items.iter().enumerate() {
+                let minlen = aligned_de_len(name.len());
+                let rec = if i == items.len() - 1 {
+                    tail_start - off
+                } else {
+                    minlen
+                };
+                let mut de = Ext4DirEntry::default();
+                de.write_entry(rec as u16, *ino, name, DirEntryType::from_bits_truncate(*ty));
+                de.copy_to_slice(&mut block.data, off);
+                off += minlen;
+            }
+        }
+
+        let tail = Ext4DirEntryTail::new();
+        tail.copy_to_slice(&mut block.data);
+        self.dir_set_csum(block, dir_ino, ino_gen);
+    }
+
+    /// Format `block` as a dx_root: fake `.`/`..`, dx_root_info, and a single
+    /// dx_entry covering the whole hash range and pointing at `first_leaf`.
+    fn dx_format_root(
+        &self,
+        block: &mut Block,
+        dir_ino: u32,
+        dotdot_ino: u32,
+        hash_version: u8,
+        first_leaf: u32,
+    ) {
+        let bs = self.block_size();
+        for b in block.data.iter_mut() {
+            *b = 0;
+        }
+
+        let mut dot = Ext4DirEntry::default();
+        dot.write_entry(12, dir_ino, ".", DirEntryType::EXT4_DE_DIR);
+        dot.copy_to_slice(&mut block.data, 0);
+
+        let mut dotdot = Ext4DirEntry::default();
+        dotdot.write_entry((bs - 12) as u16, dotdot_ino, "..", DirEntryType::EXT4_DE_DIR);
+        dotdot.copy_to_slice(&mut block.data, 12);
+
+        // dx_root_info @ 0x18: reserved(4)=0, hash_version, info_length=8, levels=0
+        block.data[0x1c] = hash_version;
+        block.data[0x1d] = 8;
+        block.data[0x1e] = 0;
+        block.data[0x1f] = 0;
+
+        let eo = DX_ROOT_ENTRIES_OFFSET;
+        dx_set_limit(&mut block.data, eo, self.dx_block_limit(eo));
+        dx_set_count(&mut block.data, eo, 1);
+        // entry[0]'s hash slot is the count/limit header; only its block matters.
+        block.data[eo + 4..eo + 8].copy_from_slice(&first_leaf.to_le_bytes());
+        // The caller sets the dx_tail checksum once the block is fully built.
+    }
+
+    /// Convert a full single-block directory into an HTree: move its entries to
+    /// a new leaf (logical block 1) and reformat block 0 as the dx_root.
+    pub(crate) fn dx_convert_to_htree(&self, parent: &mut Ext4InodeRef) -> Result<()> {
+        let bs = self.block_size();
+        let gen = parent.inode.generation();
+        let dir_ino = parent.inode_num;
+
+        let p0 = self.get_pblock_idx(parent, 0)?;
+        let block0 = Block::load(&self.block_device, p0 as usize * bs, bs);
+
+        // Capture `..` (grandparent inode) and all real entries.
+        let mut dotdot = 0u32;
+        {
+            let limit = bs - size_of::<Ext4DirEntryTail>();
+            let mut off = 0;
+            while off < limit {
+                let de = match Ext4DirEntry::try_from(&block0.data[off..]) {
+                    Ok(de) => de,
+                    Err(_) => break,
+                };
+                let rl = de.entry_len() as usize;
+                if rl == 0 {
+                    break;
+                }
+                if !de.unused() && de.get_name() == ".." {
+                    dotdot = de.inode;
+                }
+                off += rl;
+            }
+        }
+        let items = self.dx_read_leaf_entries(&block0.data);
+
+        // Allocate leaf block 1 and move the entries there.
+        let leaf_lblk = (parent.inode.size() / bs as u64) as u32;
+        let leaf_pblk = self.append_inode_pblk(parent)?;
+        let mut leaf = Block::load(&self.block_device, leaf_pblk as usize * bs, bs);
+        self.dx_write_leaf(&mut leaf, &items, dir_ino, gen);
+        leaf.sync_blk_to_disk(&self.block_device);
+
+        // Reformat block 0 as the dx_root pointing at the new leaf.
+        let hash_version = self.super_block.default_hash_version();
+        let mut root = Block::load(&self.block_device, p0 as usize * bs, bs);
+        self.dx_format_root(&mut root, dir_ino, dotdot, hash_version, leaf_lblk);
+        // Recompute the root csum with the real generation.
+        self.dx_set_csum(&mut root, dir_ino, gen, DX_ROOT_ENTRIES_OFFSET);
+        root.sync_blk_to_disk(&self.block_device);
+
+        // Mark the directory indexed.
+        let flags = parent.inode.flags() | (EXT4_INODE_FLAG_INDEX as u32);
+        parent.inode.set_flags(flags);
+        self.write_back_inode(parent);
+        Ok(())
+    }
+
+    /// Insert `(hash -> blk)` into the dx_root's sorted entry array. Returns
+    /// `ENOSPC` when the root is full (depth growth is a later phase).
+    fn dx_insert_dxentry(
+        &self,
+        parent: &mut Ext4InodeRef,
+        eo: usize,
+        hash: u32,
+        blk: u32,
+    ) -> Result<()> {
+        let bs = self.block_size();
+        let p0 = self.get_pblock_idx(parent, 0)?;
+        let mut root = Block::load(&self.block_device, p0 as usize * bs, bs);
+
+        let count = dx_count(&root.data, eo) as usize;
+        let limit = dx_limit(&root.data, eo) as usize;
+        if count >= limit {
+            return_errno_with_message!(Errno::ENOSPC, "dx index node full");
+        }
+
+        // entries[1..count] are hash-sorted; find the slot for `hash`.
+        let mut pos = count;
+        for i in 1..count {
+            if dx_get_entry(&root.data, eo, i).0 > hash {
+                pos = i;
+                break;
+            }
+        }
+        for i in (pos..count).rev() {
+            let (h, b) = dx_get_entry(&root.data, eo, i);
+            dx_set_entry(&mut root.data, eo, i + 1, h, b);
+        }
+        dx_set_entry(&mut root.data, eo, pos, hash, blk);
+        dx_set_count(&mut root.data, eo, (count + 1) as u16);
+
+        self.dx_set_csum(&mut root, parent.inode_num, parent.inode.generation(), eo);
+        root.sync_blk_to_disk(&self.block_device);
+        Ok(())
+    }
+
+    /// Split the full leaf at `leaf_lblk` in two by hash, moving the upper half
+    /// to a new leaf and registering it in the dx_root.
+    fn dx_split_leaf(&self, parent: &mut Ext4InodeRef, leaf_lblk: u32) -> Result<()> {
+        let bs = self.block_size();
+        let gen = parent.inode.generation();
+        let dir_ino = parent.inode_num;
+        let (hv, seed) = self.dx_hash_params(parent)?;
+
+        let leaf_pblk = self.get_pblock_idx(parent, leaf_lblk)?;
+        let leaf = Block::load(&self.block_device, leaf_pblk as usize * bs, bs);
+        let mut items: Vec<(u32, String, u32, u8)> = self
+            .dx_read_leaf_entries(&leaf.data)
+            .into_iter()
+            .map(|(name, ino, ty)| {
+                let (h, _) = ext4_dir_hash(name.as_bytes(), hv, seed);
+                (h, name, ino, ty)
+            })
+            .collect();
+        if items.len() < 2 {
+            return_errno_with_message!(Errno::ENOSPC, "leaf too small to split");
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Choose a split point on a hash boundary (entries with the same hash
+        // must stay in the same leaf so the index can find them).
+        let n = items.len();
+        let mut mid = n / 2;
+        while mid < n && items[mid].0 == items[mid - 1].0 {
+            mid += 1;
+        }
+        if mid >= n {
+            mid = n / 2;
+            while mid > 0 && items[mid].0 == items[mid - 1].0 {
+                mid -= 1;
+            }
+        }
+        if mid == 0 || mid >= n {
+            return_errno_with_message!(Errno::ENOSPC, "leaf dominated by one hash");
+        }
+        let split_hash = items[mid].0;
+
+        let new_lblk = (parent.inode.size() / bs as u64) as u32;
+        let new_pblk = self.append_inode_pblk(parent)?;
+
+        let lower: Vec<(String, u32, u8)> =
+            items[..mid].iter().map(|x| (x.1.clone(), x.2, x.3)).collect();
+        let upper: Vec<(String, u32, u8)> =
+            items[mid..].iter().map(|x| (x.1.clone(), x.2, x.3)).collect();
+
+        let mut oldb = Block::load(&self.block_device, leaf_pblk as usize * bs, bs);
+        self.dx_write_leaf(&mut oldb, &lower, dir_ino, gen);
+        oldb.sync_blk_to_disk(&self.block_device);
+
+        let mut newb = Block::load(&self.block_device, new_pblk as usize * bs, bs);
+        self.dx_write_leaf(&mut newb, &upper, dir_ino, gen);
+        newb.sync_blk_to_disk(&self.block_device);
+
+        self.dx_insert_dxentry(parent, DX_ROOT_ENTRIES_OFFSET, split_hash, new_lblk)
+    }
+
+    /// Add an entry to an HTree-indexed directory: descend to the target leaf,
+    /// insert, and split that leaf (retrying) if it is full.
+    pub fn dx_add_entry(
+        &self,
+        parent: &mut Ext4InodeRef,
+        child_inode: u32,
+        name: &str,
+        de_type: DirEntryType,
+    ) -> Result<usize> {
+        let bs = self.block_size();
+        let gen = parent.inode.generation();
+
+        let leaf_lblk = self.dx_probe(parent, name)?;
+        let leaf_pblk = self.get_pblock_idx(parent, leaf_lblk)?;
+        let mut leaf = Block::load(&self.block_device, leaf_pblk as usize * bs, bs);
+        if self
+            .try_insert_to_existing_block(&mut leaf, name, child_inode, de_type)
+            .is_ok()
+        {
+            self.dir_set_csum(&mut leaf, parent.inode_num, gen);
+            leaf.sync_blk_to_disk(&self.block_device);
+            return Ok(EOK);
+        }
+
+        // Leaf is full: split it, then insert into the correct half.
+        self.dx_split_leaf(parent, leaf_lblk)?;
+        let leaf_lblk2 = self.dx_probe(parent, name)?;
+        let leaf_pblk2 = self.get_pblock_idx(parent, leaf_lblk2)?;
+        let mut leaf2 = Block::load(&self.block_device, leaf_pblk2 as usize * bs, bs);
+        self.try_insert_to_existing_block(&mut leaf2, name, child_inode, de_type)?;
+        self.dir_set_csum(&mut leaf2, parent.inode_num, gen);
+        leaf2.sync_blk_to_disk(&self.block_device);
+        Ok(EOK)
+    }
+}
