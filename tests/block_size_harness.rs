@@ -2684,3 +2684,49 @@ fn poll_reports_regular_file_always_ready() {
         POLLIN
     );
 }
+
+// ===========================================================================
+// HTree directory indexing
+// ===========================================================================
+
+/// Oracle: ext4's own directory hash, via `debugfs dx_hash` (default zero seed).
+/// Returns (major, minor). Parses "Hash of <name> is 0x.. (minor 0x..)".
+fn debugfs_dx_hash(algo: &str, name: &str) -> (u32, u32) {
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("dx_hash -h {algo} {name}"))
+        .output()
+        .expect("debugfs dx_hash spawn");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s.lines().find(|l| l.contains("Hash of")).expect("hash line");
+    let after = line.split(" is ").nth(1).expect("is");
+    let hex = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).unwrap();
+    let major = hex(after.split_whitespace().next().unwrap());
+    let minor = hex(after.split("minor ").nth(1).unwrap().trim_end_matches(')'));
+    (major, minor)
+}
+
+#[test]
+fn dx_hash_matches_debugfs() {
+    if tool_missing("debugfs") {
+        eprintln!("skipping: debugfs not available");
+        return;
+    }
+    let seed = [0u32; 4]; // zero seed => kernel default constants
+    let names = [
+        "a",
+        "foo",
+        "hello",
+        "testfile",
+        "a-longer-filename.txt",
+        "0123456789abcdef0123456789abcdef-and-then-some-more",
+    ];
+    for (algo, ver) in [("legacy", 0u8), ("half_md4", 1u8), ("tea", 2u8)] {
+        for name in names {
+            let (emaj, emin) = debugfs_dx_hash(algo, name);
+            let (maj, min) = ext4_rs::ext4_dir_hash(name.as_bytes(), ver, seed);
+            assert_eq!(maj, emaj, "{algo} major hash for {name:?}");
+            assert_eq!(min, emin, "{algo} minor hash for {name:?}");
+        }
+    }
+}

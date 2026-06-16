@@ -140,6 +140,18 @@ impl Ext4Superblock {
         1024 << self.log_block_size
     }
 
+    /// The HTree directory-hash seed (`s_hash_seed`). All-zero means "use the
+    /// kernel default seed constants".
+    pub fn hash_seed(&self) -> [u32; 4] {
+        self.hash_seed
+    }
+
+    /// The default directory-hash version (`s_def_hash_version`) new HTree
+    /// indexes are built with.
+    pub fn default_hash_version(&self) -> u8 {
+        self.default_hash_version
+    }
+
     /// Returns the number of inodes in each block group.
     pub fn inodes_per_group(&self) -> u32 {
         self.inodes_per_group

@@ -13,6 +13,9 @@ pub use utils::*;
 mod ext4_defs;
 mod ext4_impls;
 
+// HTree directory hashing + index helpers (publicly testable).
+pub use ext4_impls::htree::*;
+
 pub mod fuse_interface;
 pub mod simple_interface;
 
