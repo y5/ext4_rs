@@ -806,8 +806,27 @@ impl Ext4 {
     /// requested size. Send an empty buffer on end of stream. fh will contain the
     /// value set by the opendir method, or will be undefined if the opendir method
     /// didn't set any value.
-    fn fuse_readdirplus(&mut self, ino: u64, fh: u64, offset: i64) {
-        unimplemented!();
+    pub fn fuse_readdirplus(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+    ) -> Result<Vec<Ext4DirEntryPlus>> {
+        // Same entries and resume cookies as readdir, plus each entry's stat.
+        let block_size = self.block_size() as u32;
+        let plus = self
+            .dir_entries_with_offset_from(ino as u32, offset as u64)
+            .into_iter()
+            .map(|e| {
+                let inode_ref = self.get_inode_ref(e.entry.inode);
+                Ext4DirEntryPlus {
+                    entry: e.entry,
+                    next_offset: e.next_offset,
+                    attr: FileAttr::from_inode_ref(&inode_ref, block_size),
+                }
+            })
+            .collect();
+        Ok(plus)
     }
 
     /// Release an open directory.

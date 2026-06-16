@@ -1895,3 +1895,64 @@ fn free_counts_consistent_1k() {
 fn free_counts_consistent_4k() {
     free_counts_consistent(4096);
 }
+
+// --- readdirplus ---
+
+/// readdirplus returns the same entries and resume cookies as readdir, with
+/// each entry's stat attributes attached. Verify the entry/cookie set matches
+/// readdir exactly and that the per-entry attrs (inode number, kind, size) are
+/// correct, including the implicit "." / ".." directories.
+fn readdirplus_attrs(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "rdplus");
+
+    // Files with distinct, known sizes.
+    let files = [("a.bin", 1000usize), ("b.bin", 5000), ("c.bin", 250)];
+    {
+        let ext4 = open_fs(&img);
+        for (name, len) in files {
+            let f = ext4.create(ROOT_INODE, name, reg_mode()).expect("create");
+            ext4.write_at(f.inode_num, 0, &payload(len)).expect("write");
+        }
+    }
+    fsck_clean(&img); // readdirplus is read-only
+
+    let ext4 = open_fs(&img);
+
+    // Same entries and cookies as plain readdir.
+    let plain = ext4.fuse_readdir(ROOT_INODE as u64, 0, 0).expect("readdir");
+    let plus = ext4.fuse_readdirplus(ROOT_INODE as u64, 0, 0).expect("readdirplus");
+    assert_eq!(plain.len(), plus.len(), "readdirplus count != readdir @ {block_size}");
+    for (p, q) in plain.iter().zip(plus.iter()) {
+        assert_eq!(q.entry.get_name(), p.entry.get_name(), "name mismatch @ {block_size}");
+        assert_eq!(q.next_offset, p.next_offset, "cookie mismatch @ {block_size}");
+        // Each entry's attr describes the inode the entry points at.
+        assert_eq!(q.attr.ino, q.entry.inode as u64, "attr.ino mismatch @ {block_size}");
+    }
+
+    // Per-entry attrs by name.
+    let by_name = |n: &str| plus.iter().find(|e| e.entry.get_name() == n).cloned();
+
+    for (name, len) in files {
+        let e = by_name(name).unwrap_or_else(|| panic!("{name} missing @ {block_size}"));
+        assert_eq!(e.attr.kind, InodeFileType::S_IFREG, "{name} kind @ {block_size}");
+        assert_eq!(e.attr.size, len as u64, "{name} size @ {block_size}");
+    }
+
+    let dot = by_name(".").expect("'.' missing");
+    assert_eq!(dot.attr.kind, InodeFileType::S_IFDIR, "'.' kind @ {block_size}");
+    assert_eq!(dot.attr.ino, ROOT_INODE as u64, "'.' ino @ {block_size}");
+    let dotdot = by_name("..").expect("'..' missing");
+    assert_eq!(dotdot.attr.kind, InodeFileType::S_IFDIR, "'..' kind @ {block_size}");
+}
+
+#[test]
+fn readdirplus_attrs_1k() {
+    readdirplus_attrs(1024);
+}
+#[test]
+fn readdirplus_attrs_4k() {
+    readdirplus_attrs(4096);
+}

@@ -2,6 +2,7 @@ use core::default;
 
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
 pub struct FileAttr {
     /// Inode number
     pub ino: u64,

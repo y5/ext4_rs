@@ -41,6 +41,16 @@ pub struct Ext4DirEntryWithOffset {
     pub next_offset: u64,
 }
 
+/// A directory entry, its resume cookie, and the attributes of the inode it
+/// points at — the unit returned by `readdirplus`, which lets the kernel fill
+/// its dentry/inode cache without a follow-up `lookup` per entry.
+#[derive(Debug, Clone, Copy)]
+pub struct Ext4DirEntryPlus {
+    pub entry: Ext4DirEntry,
+    pub next_offset: u64,
+    pub attr: FileAttr,
+}
+
 /// Internal directory entry structure.
 #[repr(C)]
 #[derive(Clone, Copy)]
