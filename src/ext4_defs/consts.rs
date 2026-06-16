@@ -18,6 +18,7 @@ pub const EXT4_INODE_MODE_TYPE_MASK: u16 = 0xF000;
 pub const EXT4_INODE_MODE_PERM_MASK: u16 = 0x0FFF;
 pub const EXT4_INODE_BLOCK_SIZE: usize = 512;
 pub const EXT4_GOOD_OLD_INODE_SIZE: u16 = 128;
+pub const EXT4_INODE_FLAG_INDEX: usize = 0x00001000; /* Directory has hashed index (htree) */
 pub const EXT4_INODE_FLAG_EXTENTS: usize = 0x00080000; /* Inode uses extents */
 
 /// Extent

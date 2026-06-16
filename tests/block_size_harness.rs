@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use ext4_rs::{BlockDevice, Errno, Ext4, InodeFileType};
+use ext4_rs::{BlockDevice, Errno, Ext4, Ext4DirEntry, Ext4DirSearchResult, InodeFileType};
 
 const ROOT_INODE: u32 = 2;
 
@@ -2729,4 +2729,133 @@ fn dx_hash_matches_debugfs() {
             assert_eq!(min, emin, "{algo} minor hash for {name:?}");
         }
     }
+}
+
+/// Build an image whose `/big` directory is HTree-indexed: populate it with `n`
+/// files via `mkfs.ext4 -d`, then `e2fsck -fyD` rebuilds it into a hash index.
+/// `long_names` pads each name so leaves fill faster, forcing a multi-level
+/// (indirect_levels ≥ 1) tree with fewer entries. Returns the image path and
+/// the file names.
+fn build_htree_fixture(
+    block_size: u32,
+    n: usize,
+    tag: &str,
+    long_names: bool,
+) -> (PathBuf, Vec<String>) {
+    let dir = Path::new("target").join("harness");
+    fs::create_dir_all(&dir).unwrap();
+
+    let src = dir.join(format!("htsrc_{tag}_{block_size}"));
+    let big = src.join("big");
+    let _ = fs::remove_dir_all(&src);
+    fs::create_dir_all(&big).unwrap();
+
+    let pad = if long_names { "_".repeat(180) } else { String::new() };
+    let mut names = Vec::with_capacity(n);
+    for i in 0..n {
+        let name = format!("file_{:04}.dat{pad}", i);
+        fs::write(big.join(&name), b"x").unwrap();
+        names.push(name);
+    }
+
+    let img = dir.join(format!("htree_{tag}_{block_size}.img"));
+    let _ = fs::remove_file(&img);
+    fs::write(&img, vec![0u8; 48 * 1024 * 1024]).unwrap();
+
+    let status = Command::new("mkfs.ext4")
+        .args(["-q", "-b", &block_size.to_string(), "-F", "-d"])
+        .arg(&src)
+        .arg(&img)
+        .status()
+        .expect("mkfs.ext4 -d spawn");
+    assert!(status.success(), "mkfs.ext4 -d failed");
+
+    // -D rebuilds directories into htree indexes; it reports changes (nonzero).
+    let _ = Command::new("e2fsck")
+        .args(["-fyD"])
+        .arg(&img)
+        .output()
+        .expect("e2fsck -fyD spawn");
+
+    (img, names)
+}
+
+#[test]
+fn htree_read_lookup_1k() {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    let (img, names) = build_htree_fixture(1024, 600, "read", false);
+    let ext4 = open_fs(&img);
+
+    let big = ext4
+        .generic_open("/big", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("open /big") as u32;
+    assert!(
+        ext4.get_inode_ref(big).inode.is_index(),
+        "fixture /big is not htree-indexed"
+    );
+
+    // Every entry is found by descending the index to its hash-assigned leaf.
+    for name in &names {
+        let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        ext4.dx_find_entry(big, name, &mut res)
+            .unwrap_or_else(|_| panic!("dx_find_entry missed {name}"));
+        assert!(res.dentry.inode != 0, "zero inode for {name}");
+    }
+
+    // A name that doesn't exist resolves to ENOENT, not a wrong leaf.
+    let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+    let miss = ext4.dx_find_entry(big, "nope_not_here.dat", &mut res);
+    assert_eq!(miss.unwrap_err().error(), Errno::ENOENT);
+
+    fsck_clean(&img);
+}
+
+/// `indirect_levels` of `path`'s htree root, parsed from `debugfs htree`.
+fn debugfs_htree_levels(img: &Path, path: &str) -> u8 {
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("htree {path}"))
+        .arg(img)
+        .output()
+        .expect("debugfs htree spawn");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s
+        .lines()
+        .find(|l| l.contains("Indirect levels"))
+        .expect("indirect levels line");
+    line.rsplit(':').next().unwrap().trim().parse().unwrap()
+}
+
+#[test]
+fn htree_read_lookup_multilevel_1k() {
+    if !tooling_ready() || tool_missing("debugfs") {
+        return;
+    }
+    // Long names fill leaves fast, so 700 entries overflow the root into a
+    // depth-1 tree — exercising the dx_node descent, not just the root.
+    let (img, names) = build_htree_fixture(1024, 700, "readml", true);
+    assert!(
+        debugfs_htree_levels(&img, "/big") >= 1,
+        "fixture is not multi-level; dx_node descent would be untested"
+    );
+
+    let ext4 = open_fs(&img);
+    let big = ext4
+        .generic_open("/big", &mut ROOT_INODE.clone(), false, 0, &mut 0)
+        .expect("open /big") as u32;
+
+    for name in &names {
+        let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        ext4.dx_find_entry(big, name, &mut res)
+            .unwrap_or_else(|_| panic!("dx_find_entry missed {name}"));
+        assert!(res.dentry.inode != 0, "zero inode for {name}");
+    }
+
+    let mut res = Ext4DirSearchResult::new(Ext4DirEntry::default());
+    let miss = ext4.dx_find_entry(big, "file_9999.datnope", &mut res);
+    assert_eq!(miss.unwrap_err().error(), Errno::ENOENT);
+
+    fsck_clean(&img);
 }

@@ -3,7 +3,16 @@
 //! This module ports the directory hash from `fs/ext4/hash.c` and (in later
 //! phases) the dx_root/dx_node index traversal and maintenance.
 
+use crate::ext4_defs::*;
 use crate::prelude::*;
+use crate::return_errno_with_message;
+
+/// Byte offset of the `dx_entry` array within a dx_root block: fake `.` (12) +
+/// fake `..` (12) + `dx_root_info` (8).
+const DX_ROOT_ENTRIES_OFFSET: usize = 0x20;
+/// Byte offset of the `dx_entry` array within a dx_node block: an 8-byte fake
+/// dirent claiming the whole block.
+const DX_NODE_ENTRIES_OFFSET: usize = 8;
 
 /// Directory hash versions (`s_def_hash_version` / `dx_root_info.hash_version`).
 pub const DX_HASH_LEGACY: u8 = 0;
@@ -230,4 +239,109 @@ pub fn ext4_dir_hash(name: &[u8], hash_version: u8, seed: [u32; 4]) -> (u32, u32
         hash = (EXT4_HTREE_EOF_32BIT - 1) << 1;
     }
     (hash, minor_hash)
+}
+
+/// One parsed dx index block: where its entry array starts, plus its count.
+struct DxBlock {
+    block: Block,
+    entries_off: usize,
+    count: u16,
+}
+
+impl DxBlock {
+    /// `(hash, child_block)` of entry `i`. Entry 0's hash slot holds the
+    /// count/limit header, so its hash is meaningless — only `.1` is used.
+    fn entry(&self, i: usize) -> (u32, u32) {
+        let o = self.entries_off + i * 8;
+        let h = u32::from_le_bytes(self.block.data[o..o + 4].try_into().unwrap());
+        let b = u32::from_le_bytes(self.block.data[o + 4..o + 8].try_into().unwrap());
+        (h, b)
+    }
+
+    /// The child block whose hash range covers `target` (largest entry whose
+    /// hash ≤ target; entry 0 covers the lowest range).
+    fn lookup(&self, target: u32) -> u32 {
+        let mut child = self.entry(0).1;
+        let mut i = 1usize;
+        while i < self.count as usize {
+            let (h, b) = self.entry(i);
+            if target < h {
+                break;
+            }
+            child = b;
+            i += 1;
+        }
+        child
+    }
+}
+
+impl Ext4 {
+    /// Load and sanity-check one dx index block at logical block `lblock`.
+    fn dx_load_block(
+        &self,
+        dir: &Ext4InodeRef,
+        lblock: u32,
+        entries_off: usize,
+    ) -> Result<DxBlock> {
+        let bs = self.block_size();
+        let pblock = self.get_pblock_idx(dir, lblock)?;
+        let block = Block::load(&self.block_device, pblock as usize * bs, bs);
+        let count = u16::from_le_bytes([block.data[entries_off + 2], block.data[entries_off + 3]]);
+        let limit = u16::from_le_bytes([block.data[entries_off], block.data[entries_off + 1]]);
+        if count == 0 || count > limit {
+            return_errno_with_message!(Errno::EIO, "dx block: bad count/limit");
+        }
+        Ok(DxBlock {
+            block,
+            entries_off,
+            count,
+        })
+    }
+
+    /// Descend the htree index to the leaf logical block that would hold `name`.
+    pub fn dx_probe(&self, dir: &Ext4InodeRef, name: &str) -> Result<u32> {
+        // Root is logical block 0.
+        let root = self.dx_load_block(dir, 0, DX_ROOT_ENTRIES_OFFSET)?;
+        let info_length = root.block.data[0x1d];
+        let mut indirect_levels = root.block.data[0x1e];
+        if info_length != 8 {
+            return_errno_with_message!(Errno::ENOTSUP, "dx_root: unexpected info_length");
+        }
+        let hash_version = root.block.data[0x1c];
+
+        let seed = self.super_block.hash_seed();
+        let (hash, _minor) = ext4_dir_hash(name.as_bytes(), hash_version, seed);
+
+        let mut node = root;
+        loop {
+            let child = node.lookup(hash);
+            if indirect_levels == 0 {
+                return Ok(child); // leaf logical block
+            }
+            node = self.dx_load_block(dir, child, DX_NODE_ENTRIES_OFFSET)?;
+            indirect_levels -= 1;
+        }
+    }
+
+    /// Look up `name` in an htree-indexed directory via the index. Populates
+    /// `result` like `dir_find_entry`. Errors with `ENOTSUP` if the directory
+    /// is not indexed, `ENOENT` if the name is absent from its hash leaf.
+    pub fn dx_find_entry(
+        &self,
+        parent_inode: u32,
+        name: &str,
+        result: &mut Ext4DirSearchResult,
+    ) -> Result<usize> {
+        let dir = self.get_inode_ref(parent_inode);
+        if !dir.inode.is_index() {
+            return_errno_with_message!(Errno::ENOTSUP, "dx_find_entry on non-indexed directory");
+        }
+        let leaf = self.dx_probe(&dir, name)?;
+        let bs = self.block_size();
+        let pblock = self.get_pblock_idx(&dir, leaf)?;
+        let block = Block::load(&self.block_device, pblock as usize * bs, bs);
+        self.dir_find_in_block(&block, name, result)?;
+        result.pblock_id = pblock as usize;
+        Ok(EOK)
+    }
 }

@@ -40,6 +40,17 @@ impl Ext4 {
             return_errno_with_message!(Errno::ENOTDIR, "dir_find_entry on non-directory inode");
         }
 
+        // Indexed directories: descend the hash tree to the one leaf that can
+        // hold this name. A truly-absent name is ENOENT; only a structural
+        // anomaly in the index falls through to the linear scan below.
+        if parent.inode.is_index() {
+            match self.dx_find_entry(parent_inode, name, result) {
+                Ok(ok) => return Ok(ok),
+                Err(e) if e.error() == Errno::ENOENT => return Err(e),
+                Err(_) => { /* fall back to a full linear scan */ }
+            }
+        }
+
         // start from the first logical block
         let mut iblock = 0;
         // physical block id

@@ -11,6 +11,7 @@ pub use crate::ext4_defs::Ext4;
 pub use crate::ext4_defs::InodeFileType;
 pub use crate::ext4_defs::BLOCK_SIZE;
 pub use crate::ext4_defs::{FileLock, F_RDLCK, F_UNLCK, F_WRLCK};
+pub use crate::ext4_defs::{Ext4DirEntry, Ext4DirSearchResult};
 
 /// fuser interface for ext4
 impl Ext4 {

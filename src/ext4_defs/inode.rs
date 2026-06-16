@@ -319,6 +319,11 @@ impl Ext4Inode {
         self.file_type() == InodeFileType::S_IFDIR
     }
 
+    /// Whether this directory carries a hashed (HTree) index.
+    pub fn is_index(&self) -> bool {
+        self.flags & (EXT4_INODE_FLAG_INDEX as u32) != 0
+    }
+
     pub fn is_file(&self) -> bool {
         self.file_type() == InodeFileType::S_IFREG
     }
