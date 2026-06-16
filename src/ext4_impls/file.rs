@@ -356,10 +356,7 @@ impl Ext4 {
     /// (atomic abort). On a plain `open` both begin/end are no-ops, so this is a
     /// pure pass-through to `write_at_impl` with identical behavior.
     pub fn write_at(&self, inode: u32, offset: usize, write_buf: &[u8]) -> Result<usize> {
-        self.journal_begin()?;
-        let r = self.write_at_impl(inode, offset, write_buf);
-        self.journal_end(r.is_ok())?;
-        r
+        self.journaled(|| self.write_at_impl(inode, offset, write_buf))
     }
 
     fn write_at_impl(&self, inode: u32, offset: usize, write_buf: &[u8]) -> Result<usize> {

@@ -88,7 +88,7 @@ impl JournalDevice {
         self.state.lock().crash = c;
     }
 
-    /// Take (and clear) the pending crash point. Returns None if unset.
+    /// Take (and clear) the pending crash point. Returns `CrashPoint::None` if unset.
     pub fn take_crash(&self) -> CrashPoint {
         let mut s = self.state.lock();
         core::mem::replace(&mut s.crash, CrashPoint::None)

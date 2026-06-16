@@ -135,6 +135,9 @@ impl Ext4 {
 
     /// End a mutating op: commit the transaction if `ok`, else discard it (no-op if
     /// not journaled). Honors a test-injected crash point.
+    ///
+    /// On `ok == false` the running transaction is discarded — its captured writes
+    /// never reach disk (atomic abort).
     pub fn journal_end(&self, ok: bool) -> Result<()> {
         if let (Some(jd), Some(j)) = (&self.journal_device, &self.journal) {
             if let Some(txn) = jd.end() {
@@ -146,6 +149,18 @@ impl Ext4 {
             }
         }
         Ok(())
+    }
+
+    /// Run a mutating filesystem operation inside a journal transaction: begin,
+    /// run `op`, then commit if it succeeded or discard (atomic abort) if it
+    /// failed. A no-op wrapper when journaling is off. This is the ONLY correct way
+    /// to journal an op — it guarantees the transaction is always closed, so the
+    /// body may use `?` freely without leaking an open transaction.
+    pub fn journaled<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.journal_begin()?;
+        let r = op();
+        self.journal_end(r.is_ok())?;
+        r
     }
 
     // with dir result search path offset
