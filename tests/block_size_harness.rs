@@ -126,6 +126,22 @@ fn fsck_clean(img: &Path) {
     );
 }
 
+/// Full e2fsck report (stdout+stderr) regardless of exit status. Needed for
+/// discrepancies e2fsck reports but does not treat as fatal (e.g. superblock
+/// free-count summaries), which `fsck_clean` would not catch.
+fn fsck_output(img: &Path) -> String {
+    let out = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(img)
+        .output()
+        .expect("e2fsck failed to spawn");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 /// Run a debugfs command against the image (read-write), returning stdout.
 fn debugfs(img: &Path, request: &str) -> String {
     let out = Command::new("debugfs")
@@ -1836,4 +1852,46 @@ fn dir_multiblock_1k() {
 #[test]
 fn dir_multiblock_4k() {
     dir_multiblock(4096);
+}
+
+// --- superblock free-count accounting ---
+
+/// Many single allocations in one session (creating entries allocates an inode
+/// each, and growing the directory allocates a block each) must leave the
+/// superblock's free inode/block counters correct. e2fsck exits 0 on a
+/// superblock-summary mismatch, so assert on its report text rather than its
+/// exit status.
+fn free_counts_consistent(block_size: u32) {
+    if !tooling_ready() {
+        return;
+    }
+    let img = fresh_image(block_size, "freecount");
+
+    let n = 250usize;
+    {
+        let ext4 = open_fs(&img);
+        for i in 0..n {
+            ext4.create(ROOT_INODE, &format!("g{i:04}"), reg_mode())
+                .expect("create");
+        }
+    }
+
+    let report = fsck_output(&img);
+    assert!(
+        !report.contains("Free inodes count wrong"),
+        "superblock free inode count drifted @ {block_size}:\n{report}"
+    );
+    assert!(
+        !report.contains("Free blocks count wrong"),
+        "superblock free blocks count drifted @ {block_size}:\n{report}"
+    );
+}
+
+#[test]
+fn free_counts_consistent_1k() {
+    free_counts_consistent(1024);
+}
+#[test]
+fn free_counts_consistent_4k() {
+    free_counts_consistent(4096);
 }

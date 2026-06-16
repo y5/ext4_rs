@@ -57,6 +57,21 @@ impl Ext4 {
         }
         zones
     }
+
+    /// Read a fresh copy of the superblock from disk.
+    ///
+    /// The geometry fields are immutable, but the free inode/block counters
+    /// change as allocations happen. `self.super_block` is captured at `open`
+    /// and never updated (the allocation methods take `&self`), so a free-count
+    /// read-modify-write that starts from it persists only a single decrement
+    /// no matter how many allocations ran. Reading the live on-disk value
+    /// immediately before each such update keeps the counters correct. The
+    /// block-group descriptors are already handled this way (`load_new`).
+    pub fn read_super_block(&self) -> Ext4Superblock {
+        let block = Block::load(&self.block_device, SUPERBLOCK_OFFSET, SUPERBLOCK_OFFSET);
+        block.read_as()
+    }
+
     /// Opens and loads an Ext4 from the `block_device`.
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Self {
         // Load the superblock. It lives at byte 1024 and is 1024 bytes; the

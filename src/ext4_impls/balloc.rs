@@ -350,7 +350,7 @@ impl Ext4 {
         block_group: &mut Ext4BlockGroup,
         bgid: usize,
     ) -> Result<()> {
-        let mut super_block = self.super_block;
+        let mut super_block = self.read_super_block();
         let block_size = self.block_size() as u64;
 
         // Update superblock free blocks count
@@ -380,7 +380,7 @@ impl Ext4 {
         let mut count = count as usize;
         let mut start = start;
 
-        let mut super_block = self.super_block;
+        let mut super_block = self.read_super_block();
 
         // Derive group/index through the same helpers the allocator uses so the
         // free path stays symmetric with it. With first_data_block != 0 (1 KiB
@@ -651,7 +651,7 @@ impl Ext4 {
                 block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, super_block);
 
                 // Update superblock free blocks count
-                let mut sb_copy = *super_block;
+                let mut sb_copy = self.read_super_block();
                 let sb_free_blocks = sb_copy.free_blocks_count();
                 sb_copy.set_free_blocks_count(sb_free_blocks - found_blocks as u64);
                 sb_copy.sync_to_disk_with_csum(&self.block_device);
