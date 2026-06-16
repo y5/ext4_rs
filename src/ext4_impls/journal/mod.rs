@@ -13,8 +13,8 @@ use crate::return_errno_with_message;
 pub use crate::ext4_defs::journal::{
     assemble_descriptor_block, finalize_commit_csum, finalize_revoke_csum,
     jbd2_block_csum, jbd2_csum_seed, jbd2_data_block_csum, parse_descriptor_block,
-    verify_commit_csum, verify_revoke_csum, BlockTag, CommitBlock, JournalSuperblock,
-    RevokeBlock, TagFormat, JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK,
+    patch_journal_sb_head, verify_commit_csum, verify_revoke_csum, BlockTag, CommitBlock,
+    JournalSuperblock, RevokeBlock, TagFormat, JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK,
     JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2,
     JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FEATURE_INCOMPAT_REVOKE, JBD2_FLAG_DELETED,
     JBD2_FLAG_ESCAPE, JBD2_FLAG_LAST_TAG, JBD2_FLAG_SAME_UUID, JBD2_MAGIC_NUMBER,
@@ -284,11 +284,12 @@ impl Journal {
         }
         fs.block_device.flush();
         // Clear the journal: re-read the live superblock block, set s_start=0 and
-        // s_sequence = last_committed + 1, write it back, flush. (put_be32 is
-        // module-private in the codec; patch the 4 BE bytes in place instead.)
+        // s_sequence = last_committed + 1, write it back, flush. We patch the two
+        // BE fields in place (rather than re-emit) to preserve fields the parser
+        // doesn't model — s_checksum, s_errno, s_nr_users, … — which a full
+        // emit() would zero, corrupting the superblock.
         let mut sb_block = self.read_log_block(fs, 0)?;
-        sb_block[24..28].copy_from_slice(&scan.last_sequence.wrapping_add(1).to_be_bytes()); // s_sequence
-        sb_block[28..32].copy_from_slice(&0u32.to_be_bytes()); // s_start
+        patch_journal_sb_head(&mut sb_block, scan.last_sequence.wrapping_add(1), 0);
         self.write_log_block(fs, 0, &sb_block)?;
         fs.block_device.flush();
         Ok(())

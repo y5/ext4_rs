@@ -219,6 +219,21 @@ impl JournalSuperblock {
     }
 }
 
+/// Byte offsets of the two journal-superblock fields recovery/commit patch in
+/// place. Patched directly (rather than via emit()) to preserve fields the
+/// parser doesn't model — notably s_checksum and s_errno — which a full re-emit
+/// would zero.
+pub const JSB_OFF_SEQUENCE: usize = 24; // s_sequence (BE u32): first expected commit id
+pub const JSB_OFF_START: usize = 28;    // s_start (BE u32): log start block; 0 == clean
+
+/// Patch s_sequence and s_start of a journal superblock block in place (BE),
+/// leaving every other field byte-for-byte untouched.
+pub fn patch_journal_sb_head(sb_block: &mut [u8], sequence: u32, start: u32) {
+    debug_assert!(sb_block.len() >= JSB_OFF_START + 4);
+    sb_block[JSB_OFF_SEQUENCE..JSB_OFF_SEQUENCE + 4].copy_from_slice(&sequence.to_be_bytes());
+    sb_block[JSB_OFF_START..JSB_OFF_START + 4].copy_from_slice(&start.to_be_bytes());
+}
+
 /// Which on-disk block-tag layout a journal uses, selected by its incompat
 /// feature flags.
 ///

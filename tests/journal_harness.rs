@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use ext4_rs::{
     assemble_descriptor_block, finalize_commit_csum, finalize_revoke_csum, jbd2_csum_seed,
-    jbd2_data_block_csum, parse_descriptor_block, verify_commit_csum, BlockDevice, BlockTag,
-    CommitBlock, Ext4, Journal, RevokeBlock, TagFormat, JBD2_FEATURE_INCOMPAT_64BIT,
-    JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FLAG_LAST_TAG,
+    jbd2_data_block_csum, parse_descriptor_block, patch_journal_sb_head, verify_commit_csum,
+    BlockDevice, BlockTag, CommitBlock, Ext4, Journal, RevokeBlock, TagFormat,
+    JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3,
+    JBD2_FLAG_LAST_TAG,
 };
 
 /// A file-backed block device over an on-disk image.
@@ -215,11 +216,10 @@ fn stage_dirty_journal(fs: &Ext4, j: &Journal, txns: &[SynthTxn]) -> u32 {
     }
 
     // Patch the on-disk journal superblock (log block 0) so it looks dirty:
-    // s_sequence (BE @24) and s_start (BE @28). Direct BE patch avoids depending
-    // on emit() fidelity for unrelated fields.
+    // s_sequence = txns[0].sequence and s_start = j.sb.first. The in-place patch
+    // avoids depending on emit() fidelity for unrelated fields.
     let mut sb_block = j.read_log_block(fs, 0).expect("read journal sb");
-    sb_block[24..28].copy_from_slice(&txns[0].sequence.to_be_bytes()); // s_sequence
-    sb_block[28..32].copy_from_slice(&j.sb.first.to_be_bytes()); // s_start
+    patch_journal_sb_head(&mut sb_block, txns[0].sequence, j.sb.first);
     j.write_log_block(fs, 0, &sb_block).expect("write journal sb");
 
     cursor
@@ -265,6 +265,41 @@ fn recovery_replays_committed_and_honors_revoke_4k() {
     j.recover(&fs).expect("second recover ok");
     let sb2 = j.read_log_block(&fs, 0).unwrap();
     assert_eq!(u32::from_be_bytes(sb2[28..32].try_into().unwrap()), 0);
+}
+
+#[test]
+fn recovery_same_txn_revoke_skips_block_4k() {
+    if tool_missing("mkfs.ext4") { eprintln!("skip"); return; }
+    let img = fresh_image(4096, "jrevself");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load").expect("journal");
+    let base = j.sb.sequence;
+    let bs = fs.block_size();
+
+    let p = 4010u64;             // plain replayed block (control)
+    let q = 4011u64;             // journaled AND revoked in the SAME txn → must be skipped
+    let data_p = vec![0x11; bs];
+    let data_q = vec![0x22; bs]; // stale body that must NOT land at q
+
+    // Pre-seed q's final location with a sentinel; recovery must leave it intact.
+    let sentinel = vec![0x99; bs];
+    fs.block_device.write_offset(q as usize * bs, &sentinel);
+
+    // One txn that logs both p and q, and revokes q within the same txn.
+    let txns = vec![
+        SynthTxn { sequence: base, blocks: vec![(p, data_p.clone()), (q, data_q.clone())], revokes: vec![q] },
+    ];
+    stage_dirty_journal(&fs, &j, &txns);
+
+    j.recover(&fs).expect("recover");
+
+    // Control: p replayed.
+    assert_eq!(fs.block_device.read_offset(p as usize * bs, bs), data_p);
+    // Boundary: q revoked at rseq == txn.sequence → skipped; sentinel survives,
+    // stale data_q never written. (A buggy `>` comparison would overwrite the
+    // sentinel with data_q and fail this.)
+    assert_eq!(fs.block_device.read_offset(q as usize * bs, bs), sentinel);
 }
 
 #[test]
