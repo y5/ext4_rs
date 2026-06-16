@@ -9,7 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use ext4_rs::{BlockDevice, Ext4, Journal};
+use ext4_rs::{
+    assemble_descriptor_block, finalize_commit_csum, finalize_revoke_csum, jbd2_csum_seed,
+    jbd2_data_block_csum, parse_descriptor_block, verify_commit_csum, BlockDevice, BlockTag,
+    CommitBlock, Ext4, Journal, RevokeBlock, TagFormat, JBD2_FEATURE_INCOMPAT_64BIT,
+    JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FLAG_LAST_TAG,
+};
 
 /// A file-backed block device over an on-disk image.
 struct FileBlockDevice {
@@ -116,4 +121,169 @@ fn journal_log_block_read_write_roundtrip_4k() {
 
     // Wrong-size write is rejected.
     assert!(j.write_log_block(&fs, 5, &vec![0u8; bs - 1]).is_err());
+}
+
+/// One synthetic transaction to lay into the log: a set of (final-blocknr, body)
+/// data blocks plus an optional list of revoked block numbers.
+struct SynthTxn {
+    sequence: u32,
+    blocks: Vec<(u64, Vec<u8>)>,
+    revokes: Vec<u64>,
+}
+
+/// Pad/truncate `data` to exactly `bs` bytes (zero-filled).
+fn block_body(data: &[u8], bs: usize) -> Vec<u8> {
+    let mut b = vec![0u8; bs];
+    let n = data.len().min(bs);
+    b[..n].copy_from_slice(&data[..n]);
+    b
+}
+
+/// Write `txns` into the journal log starting at log block `j.sb.first`, chaining
+/// per txn: `[descriptor][data blocks...]( [revoke] )[commit]` (the revoke block
+/// is emitted only when the txn has revokes). Each block is written via
+/// `j.write_log_block`. Afterwards the on-disk journal superblock is patched so
+/// the journal looks DIRTY / pre-recovery: `s_start = j.sb.first` and
+/// `s_sequence = txns[0].sequence`. Writes ONLY into the journal log (and the
+/// journal sb); it does not touch any block's final on-disk location.
+///
+/// Returns the next free log-block index.
+fn stage_dirty_journal(fs: &Ext4, j: &Journal, txns: &[SynthTxn]) -> u32 {
+    let fmt = TagFormat::from_features(j.sb.feature_incompat);
+    let has_64bit = j.sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+    let has_csum = j.sb.feature_incompat
+        & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+        != 0;
+    let seed = jbd2_csum_seed(&j.sb.uuid);
+    let bs = fs.block_size();
+
+    let mut cursor = j.sb.first;
+
+    for txn in txns {
+        // Build one tag per data block, with the per-data-block tag checksum.
+        let mut tags = Vec::with_capacity(txn.blocks.len());
+        let mut bodies = Vec::with_capacity(txn.blocks.len());
+        for (blocknr, data) in &txn.blocks {
+            let body = block_body(data, bs);
+            let checksum = jbd2_data_block_csum(seed, txn.sequence, &body);
+            tags.push(BlockTag {
+                blocknr: *blocknr,
+                flags: 0,
+                checksum,
+            });
+            bodies.push(body);
+        }
+
+        // [descriptor]
+        let desc =
+            assemble_descriptor_block(seed, txn.sequence, bs, fmt, has_64bit, has_csum, &tags);
+        j.write_log_block(fs, cursor, &desc).expect("write descriptor");
+        cursor += 1;
+
+        // [data blocks...]
+        for body in &bodies {
+            j.write_log_block(fs, cursor, body).expect("write data block");
+            cursor += 1;
+        }
+
+        // ( [revoke] ) — only when this txn revokes something.
+        if !txn.revokes.is_empty() {
+            let mut rev = RevokeBlock {
+                sequence: txn.sequence,
+                blocks: txn.revokes.clone(),
+            }
+            .emit(bs, has_64bit);
+            if has_csum {
+                finalize_revoke_csum(&mut rev, seed);
+            }
+            j.write_log_block(fs, cursor, &rev).expect("write revoke");
+            cursor += 1;
+        }
+
+        // [commit]
+        let mut commit = CommitBlock {
+            sequence: txn.sequence,
+            commit_sec: 0,
+            commit_nsec: 0,
+        }
+        .emit(bs);
+        if has_csum {
+            finalize_commit_csum(&mut commit, seed);
+        }
+        j.write_log_block(fs, cursor, &commit).expect("write commit");
+        cursor += 1;
+    }
+
+    // Patch the on-disk journal superblock (log block 0) so it looks dirty:
+    // s_sequence (BE @24) and s_start (BE @28). Direct BE patch avoids depending
+    // on emit() fidelity for unrelated fields.
+    let mut sb_block = j.read_log_block(fs, 0).expect("read journal sb");
+    sb_block[24..28].copy_from_slice(&txns[0].sequence.to_be_bytes()); // s_sequence
+    sb_block[28..32].copy_from_slice(&j.sb.first.to_be_bytes()); // s_start
+    j.write_log_block(fs, 0, &sb_block).expect("write journal sb");
+
+    cursor
+}
+
+#[test]
+fn synth_dirty_journal_layout_4k() {
+    if tool_missing("mkfs.ext4") {
+        eprintln!("skip: mkfs.ext4 missing");
+        return;
+    }
+    let img = fresh_image(4096, "jsynth");
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileBlockDevice::new(&img));
+    let fs = Ext4::open(dev);
+    let j = Journal::load(&fs).expect("load ok").expect("journal present");
+
+    let seq = j.sb.sequence;
+    let txn = SynthTxn {
+        sequence: seq,
+        blocks: vec![(1234, b"hello-block".to_vec())],
+        revokes: vec![],
+    };
+    let next = stage_dirty_journal(&fs, &j, &[txn]);
+    // descriptor + 1 data + commit = 3 blocks consumed from j.sb.first.
+    assert_eq!(next, j.sb.first + 3);
+
+    let fmt = TagFormat::from_features(j.sb.feature_incompat);
+    let has_64bit = j.sb.feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+    let has_csum = j.sb.feature_incompat
+        & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+        != 0;
+    let seed = jbd2_csum_seed(&j.sb.uuid);
+    let bs = fs.block_size();
+
+    // Re-read the descriptor (log block `first`) and parse it back.
+    let desc = j.read_log_block(&fs, j.sb.first).expect("read descriptor");
+    let tags = parse_descriptor_block(&desc, fmt, has_64bit).expect("parse descriptor");
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].blocknr, 1234);
+    assert_ne!(tags[0].flags & JBD2_FLAG_LAST_TAG, 0);
+    // Descriptor tail csum is only written (and meaningful) when the journal
+    // carries a CSUM feature. Stock mkfs.ext4 journals have NO journal-level
+    // incompat features, so this is normally skipped; it exercises the tail
+    // when run against a csum-enabled journal.
+    if has_csum {
+        let stored = u32::from_be_bytes([desc[bs - 4], desc[bs - 3], desc[bs - 2], desc[bs - 1]]);
+        let mut zeroed = desc.clone();
+        zeroed[bs - 4..bs].copy_from_slice(&[0u8; 4]);
+        assert_eq!(stored, ext4_rs::jbd2_block_csum(seed, &zeroed));
+    }
+
+    // Re-read the commit block (first + 2): parse sequence (+ verify csum when
+    // the journal carries a CSUM feature).
+    let commit = j.read_log_block(&fs, j.sb.first + 2).expect("read commit");
+    if has_csum {
+        assert!(verify_commit_csum(&commit, seed));
+    }
+    let cb = CommitBlock::parse(&commit).expect("parse commit");
+    assert_eq!(cb.sequence, seq);
+
+    // Re-read the journal superblock (log block 0): s_start@28 and s_sequence@24.
+    let sb_block = j.read_log_block(&fs, 0).expect("read journal sb");
+    let s_sequence = u32::from_be_bytes([sb_block[24], sb_block[25], sb_block[26], sb_block[27]]);
+    let s_start = u32::from_be_bytes([sb_block[28], sb_block[29], sb_block[30], sb_block[31]]);
+    assert_eq!(s_start, j.sb.first);
+    assert_eq!(s_sequence, seq);
 }
