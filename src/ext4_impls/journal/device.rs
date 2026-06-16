@@ -46,12 +46,6 @@ impl JournalDevice {
         }
     }
 
-    /// The inner device (used by commit/checkpoint in Phase 4 to write the log
-    /// and final locations directly, bypassing capture).
-    pub fn inner(&self) -> &Arc<dyn BlockDevice> {
-        &self.inner
-    }
-
     /// Begin (or nest into) a transaction at `sequence`. Nested begins share the
     /// transaction created by the outermost begin; `sequence` is used only when
     /// creating it.
@@ -79,16 +73,14 @@ impl JournalDevice {
         }
     }
 
-    pub fn is_active(&self) -> bool {
-        self.state.lock().depth > 0
-    }
-
     /// Test hook: the next commit will simulate this crash point, then reset to None.
+    #[doc(hidden)]
     pub fn set_crash(&self, c: CrashPoint) {
         self.state.lock().crash = c;
     }
 
     /// Take (and clear) the pending crash point. Returns `CrashPoint::None` if unset.
+    #[doc(hidden)]
     pub fn take_crash(&self) -> CrashPoint {
         let mut s = self.state.lock();
         core::mem::replace(&mut s.crash, CrashPoint::None)

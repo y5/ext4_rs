@@ -46,6 +46,14 @@ impl Transaction {
     }
 
     /// Mark `block` as revoked in this transaction.
+    ///
+    /// NOTE: the write-side revoke path has no production callers in this
+    /// synchronous one-transaction-per-op `data=journaled` engine — each op
+    /// checkpoints and clears the journal before the next, so there is never a
+    /// multi-transaction window in which a stale block could be replayed over
+    /// reused data. It is retained for on-disk format completeness (commit emits
+    /// a revoke block when this set is non-empty), and recovery still honors
+    /// revokes in kernel-written multi-transaction journals.
     pub fn revoke(&mut self, block: u64) {
         self.revokes.insert(block);
     }

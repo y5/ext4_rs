@@ -34,6 +34,7 @@ pub use crate::ext4_defs::journal::{
 /// un-checkpointed transaction — exactly what recovery must replay.
 /// `MidCheckpoint(n)` checkpoints only the first `n` blocks then stops (for
 /// checkpoint-idempotency testing).
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPoint {
     None,
@@ -295,6 +296,7 @@ impl Journal {
     /// precisely what recovery must replay. `MidCheckpoint(n)` checkpoints only
     /// the first `n` blocks then stops, leaving the journal still dirty (for
     /// idempotency testing).
+    #[doc(hidden)]
     pub fn commit_with_crash(
         &self,
         fs: &Ext4,
