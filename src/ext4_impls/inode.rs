@@ -12,11 +12,13 @@ impl Ext4 {
         // used in `ialloc_alloc_inode` (inode = bgid*ipg + idx + 1) and in
         // `inode_disk_pos`. Without the -1, freeing inode N clears the bit that
         // belongs to inode N+1, handing a live inode back out on the next alloc.
-        (inode_num - 1) / self.super_block.inodes_per_group()
+        // saturating_sub so a stray inode 0 can never underflow-panic the
+        // overflow-checked kernel (defense in depth; bastion fff1d6c0).
+        (inode_num.saturating_sub(1)) / self.super_block.inodes_per_group()
     }
 
     pub fn inode_to_bgidx(&self, inode_num: u32) -> u32 {
-        (inode_num - 1) % self.super_block.inodes_per_group()
+        (inode_num.saturating_sub(1)) % self.super_block.inodes_per_group()
     }
 
     /// Get inode disk position.
@@ -24,8 +26,8 @@ impl Ext4 {
         let super_block = self.super_block;
         let inodes_per_group = super_block.inodes_per_group;
         let inode_size = super_block.inode_size as u64;
-        let group = (inode_num - 1) / inodes_per_group;
-        let index = (inode_num - 1) % inodes_per_group;
+        let group = (inode_num.saturating_sub(1)) / inodes_per_group;
+        let index = (inode_num.saturating_sub(1)) % inodes_per_group;
         let block_group =
             Ext4BlockGroup::load_new(&self.block_device, &super_block, group as usize);
         let inode_table_blk_num = block_group.get_inode_table_blk_num();

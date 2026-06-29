@@ -248,11 +248,22 @@ impl Ext4 {
             *name_off += len as u32;
         }
 
-        if is_goal {
-            return Ok(dir_search_result.dentry.inode);
+        // If the path collapsed to the directory we started resolving from
+        // (e.g. "/", "", "//"), no entry was ever found and `dir_search_result`
+        // still holds its default `inode == 0`. ext4 inode numbers are 1-based,
+        // so returning 0 underflows `inode_disk_pos`/`get_bgid_of_inode`
+        // (`inode_num - 1`) in any caller that loads the result, panicking the
+        // kernel. Resolve such a path to the starting directory inode instead
+        // (for the kernel's callers that is ROOT_INODE). A fuzzed `stat("/")` /
+        // `rename` on an empty-collapsing path hit this (was bastion fff1d6c0).
+        let resolved = dir_search_result.dentry.inode;
+        if is_goal && resolved != 0 {
+            return Ok(resolved);
         }
-
-        Ok(dir_search_result.dentry.inode)
+        if resolved == 0 {
+            return Ok(*parent);
+        }
+        Ok(resolved)
     }
 
     #[allow(unused)]
