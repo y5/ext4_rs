@@ -170,9 +170,13 @@ impl Ext4 {
 
         let block_size = self.block_size();
 
-        // calculate total blocks
+        // calculate total blocks — clamp to the fs block count so a corrupt
+        // directory inode carrying a bogus huge size can't spin this walk for
+        // minutes while the caller holds the FS lock (fuzz hang@ext4_list,
+        // 2026-06-30). A real directory is far smaller than the whole fs.
         let inode_size = inode_ref.inode.size();
-        let total_blocks = inode_size / block_size as u64;
+        let total_blocks =
+            (inode_size / block_size as u64).min(self.super_block.blocks_count());
 
         // start from the first logical block
         let mut iblock = 0;
